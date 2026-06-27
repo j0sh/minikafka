@@ -1,0 +1,176 @@
+package minikafka_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/j0sh/minikafka"
+	"github.com/j0sh/minikafka/storage/memory"
+	"github.com/j0sh/minikafka/storage/sqlite"
+)
+
+func TestStoresCoreSemantics(t *testing.T) {
+	tests := []struct {
+		name string
+		open func(t *testing.T) minikafka.Store
+	}{
+		{name: "memory", open: func(t *testing.T) minikafka.Store { return memory.Open() }},
+		{name: "sqlite", open: func(t *testing.T) minikafka.Store {
+			store, err := sqlite.Open(filepath.Join(t.TempDir(), "events.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return store
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := tt.open(t)
+			if err := store.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			if err := store.CreateTopic(ctx, "events", minikafka.TopicOptions{Retention: minikafka.RetentionPolicy{MaxMessages: 2}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Topic(ctx, "events"); err != nil {
+				t.Fatal(err)
+			}
+			app, err := store.Append(ctx, minikafka.AppendRequest{Topic: "events", Records: []minikafka.Record{
+				{Timestamp: time.Now(), Key: []byte("k1"), Value: []byte("one")},
+				{Timestamp: time.Now(), Key: []byte("k2"), Value: []byte("two")},
+				{Timestamp: time.Now(), Key: []byte("k3"), Value: []byte("three")},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if app.BaseOffset != 0 || app.LastOffset != 2 {
+				t.Fatalf("unexpected append offsets: %+v", app)
+			}
+			got, err := store.Fetch(ctx, minikafka.FetchRequest{Topic: "events", Offset: 1, MaxBytes: 1, MaxRecords: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Records) == 0 || string(got.Records[0].Value) != "two" {
+				t.Fatalf("unexpected fetch: %+v", got.Records)
+			}
+			if got.HighWatermark != 3 || got.EarliestOffset != 0 || got.LatestOffset != 3 {
+				t.Fatalf("bad watermarks: %+v", got)
+			}
+			if err := store.CommitOffset(ctx, minikafka.CommitOffsetRequest{GroupID: "g", Topic: "events", Offset: 2}); err != nil {
+				t.Fatal(err)
+			}
+			off, err := store.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "g", Topic: "events"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !off.Found || off.Offset != 2 {
+				t.Fatalf("bad committed offset: %+v", off)
+			}
+			if err := store.ApplyRetention(ctx, "events"); err != nil {
+				t.Fatal(err)
+			}
+			earliest, err := store.EarliestOffset(ctx, "events")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if earliest != 1 {
+				t.Fatalf("retention should preserve offsets and drop offset 0, earliest=%d", earliest)
+			}
+			if _, err := store.Fetch(ctx, minikafka.FetchRequest{Topic: "events", Offset: 0}); !errors.Is(err, minikafka.ErrOffsetOutOfRange) {
+				t.Fatalf("fetch before earliest error = %v", err)
+			}
+		})
+	}
+}
+
+func TestStoreConcurrentAppendOffsets(t *testing.T) {
+	ctx := context.Background()
+	store := memory.Open()
+	if err := store.CreateTopic(ctx, "events", minikafka.TopicOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	const n = 64
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := store.Append(ctx, minikafka.AppendRequest{Topic: "events", Records: []minikafka.Record{{Value: []byte(fmt.Sprintf("%d", i))}}})
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest, err := store.LatestOffset(ctx, "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != n {
+		t.Fatalf("latest offset = %d, want %d", latest, n)
+	}
+}
+
+func TestSQLiteRestartAndTopicFiles(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "events.db")
+	store, err := sqlite.Open(root, sqlite.WithSynchronous(sqlite.SyncFull))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateTopic(ctx, "billing_events", minikafka.TopicOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, minikafka.AppendRequest{Topic: "billing_events", Records: []minikafka.Record{{Value: []byte("durable")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitOffset(ctx, minikafka.CommitOffsetRequest{GroupID: "g", Topic: "billing_events", Offset: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if matches, err := filepath.Glob(filepath.Join(root[:len(root)-len(filepath.Ext(root))], "billing_events.db")); err != nil || len(matches) != 1 {
+		t.Fatalf("topic sqlite file matches=%v err=%v", matches, err)
+	}
+
+	reopened, err := sqlite.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	latest, err := reopened.LatestOffset(ctx, "billing_events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != 1 {
+		t.Fatalf("latest after restart = %d", latest)
+	}
+	off, err := reopened.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "g", Topic: "billing_events"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !off.Found || off.Offset != 1 {
+		t.Fatalf("offset after restart = %+v", off)
+	}
+}
