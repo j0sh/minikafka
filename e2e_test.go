@@ -2,7 +2,6 @@ package minikafka_test
 
 import (
 	"context"
-	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -225,39 +224,21 @@ func startBrokerWithStore(t *testing.T, store minikafka.Store) *minikafka.Broker
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
 	t.Cleanup(func() {
 		cancel()
-		_ = b.Close()
-	})
-	errCh := make(chan error, 1)
-	go func() { errCh <- b.Serve(ctx) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for b.Addr() == "127.0.0.1:0" {
-		if time.Now().After(deadline) {
-			t.Fatal("broker did not start")
+		if err := b.Close(); err != nil {
+			t.Errorf("close broker: %v", err)
 		}
 		select {
 		case err := <-errCh:
-			t.Fatalf("broker exited: %v", err)
-		case <-time.After(10 * time.Millisecond):
+			if err != nil {
+				t.Errorf("serve broker: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("broker did not stop")
 		}
-	}
-	waitTCP(t, b.Addr())
+	})
+	go func() { errCh <- b.Serve(ctx) }()
 	return b
-}
-
-func waitTCP(t *testing.T, addr string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("broker was not reachable at %s: %v", addr, err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 }

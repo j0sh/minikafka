@@ -72,6 +72,17 @@ func main() {
 }
 ```
 
+`Open` binds the TCP listener synchronously and returns any bind error. `Addr()`
+immediately returns the actual bound address, including the assigned port when
+using `:0`, and remains unchanged after shutdown. Always call `Close` after a
+successful `Open`, even if `Serve` is never called or returns an error. If `Open`
+fails, it leaves the supplied store untouched.
+
+Call `Serve(ctx)` once per broker to initialize the store and accept connections.
+Connections can queue on the bound listener before initialization finishes, but
+requests are handled only afterward. Binding does not mean the store is ready for
+direct access. `Close` releases both the listener and the store.
+
 ## Topics, Retention, and Offsets
 
 Topics can be created explicitly:

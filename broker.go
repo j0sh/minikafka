@@ -41,6 +41,8 @@ type Broker struct {
 	waiters   map[string][]chan struct{}
 }
 
+// Open binds the configured TCP address synchronously. The caller must Close the
+// broker even if Serve is never called or fails. On failure, the store is untouched.
 func Open(cfg Config) (*Broker, error) {
 	if cfg.Store == nil {
 		return nil, ErrNoStoreConfigured
@@ -48,39 +50,46 @@ func Open(cfg Config) (*Broker, error) {
 	if cfg.Addr == "" {
 		cfg.Addr = "127.0.0.1:0"
 	}
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
+	addr := ln.Addr().String()
+	host, port := splitAddr(addr)
 	return &Broker{
 		cfg:     cfg,
+		ln:      ln,
+		addr:    addr,
+		host:    host,
+		port:    port,
 		closeCh: make(chan struct{}),
 		waiters: make(map[string][]chan struct{}),
 	}, nil
 }
 
+// Addr returns the bound address, including the resolved port. It is available
+// immediately after Open and remains unchanged, including after Close.
 func (b *Broker) Addr() string {
-	if b.addr != "" {
-		return b.addr
-	}
-	return b.cfg.Addr
+	return b.addr
 }
 
+// Serve initializes the store and accepts connections until Close or context
+// cancellation. Call Serve only once per broker. Open binds the listener but does
+// not initialize the store; queued connections are handled after initialization.
 func (b *Broker) Serve(ctx context.Context) error {
 	if err := b.cfg.Store.Init(ctx); err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp", b.cfg.Addr)
-	if err != nil {
-		return err
-	}
-	b.ln = ln
-	b.addr = ln.Addr().String()
-	b.host, b.port = splitAddr(b.addr)
-
 	go func() {
-		<-ctx.Done()
-		_ = b.Close()
+		select {
+		case <-ctx.Done():
+			_ = b.Close()
+		case <-b.closeCh:
+		}
 	}()
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := b.ln.Accept()
 		if err != nil {
 			select {
 			case <-b.closeCh:
@@ -93,14 +102,13 @@ func (b *Broker) Serve(ctx context.Context) error {
 	}
 }
 
+// Close releases the listener and store, including when Serve has not started.
 func (b *Broker) Close() error {
 	var err error
 	b.closeOnce.Do(func() {
 		close(b.closeCh)
 		b.wakeAll()
-		if b.ln != nil {
-			err = b.ln.Close()
-		}
+		err = b.ln.Close()
 		if storeErr := b.cfg.Store.Close(); err == nil {
 			err = storeErr
 		}
