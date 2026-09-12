@@ -29,6 +29,7 @@ func TestE2ESegmentioKafkaGoProduceConsumeCommit(t *testing.T) {
 	if err := writer.WriteMessages(ctx,
 		kafka.Message{Key: []byte("a"), Value: []byte("one")},
 		kafka.Message{Key: []byte("b"), Value: []byte("two")},
+		kafka.Message{Key: []byte("c"), Value: []byte("three")},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -42,22 +43,30 @@ func TestE2ESegmentioKafkaGoProduceConsumeCommit(t *testing.T) {
 		MaxWait:   50 * time.Millisecond,
 	})
 	defer reader.Close()
-	if err := reader.SetOffset(0); err != nil {
+	if err := reader.SetOffset(1); err != nil {
 		t.Fatal(err)
 	}
 	msg, err := reader.ReadMessage(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg.Offset != 0 || string(msg.Value) != "one" {
+	if msg.Offset != 1 || string(msg.Value) != "two" {
 		t.Fatalf("unexpected first message: offset=%d value=%q", msg.Offset, msg.Value)
 	}
 	msg, err = reader.ReadMessage(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg.Offset != 1 || string(msg.Value) != "two" {
+	if msg.Offset != 2 || string(msg.Value) != "three" {
 		t.Fatalf("unexpected second message: offset=%d value=%q", msg.Offset, msg.Value)
+	}
+	// Publishing after draining the initial records forces a new Fetch response.
+	if err := writer.WriteMessages(ctx, kafka.Message{Value: []byte("four")}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err = reader.ReadMessage(ctx)
+	if err != nil || msg.Offset != 3 || string(msg.Value) != "four" {
+		t.Fatalf("message after second fetch: %+v err=%v", msg, err)
 	}
 
 	conn, err := kafka.Dial("tcp", b.Addr())
@@ -76,7 +85,7 @@ func TestE2ESegmentioKafkaGoProduceConsumeCommit(t *testing.T) {
 	if _, err := client.OffsetCommit(ctx, &kafka.OffsetCommitRequest{
 		GroupID: "segmentio-group",
 		Topics: map[string][]kafka.OffsetCommit{
-			topic: {{Partition: 0, Offset: 2}},
+			topic: {{Partition: 0, Offset: 4}},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -105,6 +114,7 @@ func TestE2EFranzGoProduceConsume(t *testing.T) {
 	if err := producer.ProduceSync(ctx,
 		&kgo.Record{Topic: topic, Key: []byte("a"), Value: []byte("one")},
 		&kgo.Record{Topic: topic, Key: []byte("b"), Value: []byte("two")},
+		&kgo.Record{Topic: topic, Key: []byte("c"), Value: []byte("three")},
 	).FirstErr(); err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +122,7 @@ func TestE2EFranzGoProduceConsume(t *testing.T) {
 	consumer, err := kgo.NewClient(
 		kgo.SeedBrokers(b.Addr()),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
-			topic: {0: kgo.NewOffset().AtStart()},
+			topic: {0: kgo.NewOffset().At(1)},
 		}),
 		kgo.FetchMinBytes(1),
 		kgo.FetchMaxWait(50*time.Millisecond),
@@ -129,11 +139,29 @@ func TestE2EFranzGoProduceConsume(t *testing.T) {
 			t.Fatalf("fetch errors: %+v", errs)
 		}
 		for _, rec := range fetches.Records() {
+			if rec.Offset != int64(len(values)+1) {
+				t.Fatalf("unexpected franz offset %d", rec.Offset)
+			}
 			values = append(values, string(rec.Value))
 		}
 	}
-	if values[0] != "one" || values[1] != "two" {
+	if values[0] != "two" || values[1] != "three" {
 		t.Fatalf("unexpected franz values: %+v", values)
+	}
+	if err := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("four")}).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		fetches := consumer.PollFetches(ctx)
+		if errs := fetches.Errors(); len(errs) > 0 {
+			t.Fatalf("fetch errors: %+v", errs)
+		}
+		if records := fetches.Records(); len(records) > 0 {
+			if len(records) != 1 || records[0].Offset != 3 || string(records[0].Value) != "four" {
+				t.Fatalf("unexpected franz second fetch: %+v", records)
+			}
+			break
+		}
 	}
 }
 
@@ -154,7 +182,7 @@ func TestE2ESQLiteRestartPreservesRecordsAndClientCommit(t *testing.T) {
 		AllowAutoTopicCreation: true,
 		BatchTimeout:           10 * time.Millisecond,
 	}
-	if err := writer.WriteMessages(ctx, kafka.Message{Value: []byte("kept")}); err != nil {
+	if err := writer.WriteMessages(ctx, kafka.Message{Value: []byte("kept")}, kafka.Message{Value: []byte("also-kept")}); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
@@ -177,22 +205,25 @@ func TestE2ESQLiteRestartPreservesRecordsAndClientCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopenedStore.Init(ctx); err != nil {
+	reopenedBroker := startBrokerWithStore(t, reopenedStore)
+	// A protocol round trip completes only after Serve has initialized the store.
+	// Open binds the listener, but direct store reads still need initialization.
+	reopenedClient := &kafka.Client{Addr: kafka.TCP(reopenedBroker.Addr())}
+	if _, err := reopenedClient.Metadata(ctx, &kafka.MetadataRequest{Topics: []string{topic}}); err != nil {
 		t.Fatal(err)
 	}
-	defer reopenedStore.Close()
 	latest, err := reopenedStore.LatestOffset(ctx, topic)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if latest != 1 {
+	if latest != 2 {
 		t.Fatalf("latest after broker restart = %d", latest)
 	}
 	got, err := reopenedStore.Fetch(ctx, minikafka.FetchRequest{Topic: topic, Offset: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Records) != 1 || string(got.Records[0].Value) != "kept" {
+	if len(got.Records) != 2 || string(got.Records[0].Value) != "kept" {
 		t.Fatalf("records after restart = %+v", got.Records)
 	}
 	off, err := reopenedStore.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "restart-group", Topic: topic})
@@ -201,6 +232,15 @@ func TestE2ESQLiteRestartPreservesRecordsAndClientCommit(t *testing.T) {
 	}
 	if !off.Found || off.Offset != 1 {
 		t.Fatalf("committed offset after restart = %+v", off)
+	}
+	reader := kafka.NewReader(kafka.ReaderConfig{Brokers: []string{reopenedBroker.Addr()}, Topic: topic, Partition: 0, MinBytes: 1, MaxBytes: 1 << 20, MaxWait: 50 * time.Millisecond})
+	defer reader.Close()
+	if err := reader.SetOffset(off.Offset); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := reader.ReadMessage(ctx)
+	if err != nil || msg.Offset != 1 || string(msg.Value) != "also-kept" {
+		t.Fatalf("wire fetch after restart: %+v err=%v", msg, err)
 	}
 	topicDir := root[:len(root)-len(filepath.Ext(root))]
 	if matches, err := filepath.Glob(filepath.Join(topicDir, topic+".db")); err != nil || len(matches) != 1 {

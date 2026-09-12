@@ -88,7 +88,57 @@ func TestStoresCoreSemantics(t *testing.T) {
 			if _, err := store.Fetch(ctx, minikafka.FetchRequest{Topic: "events", Offset: 0}); !errors.Is(err, minikafka.ErrOffsetOutOfRange) {
 				t.Fatalf("fetch before earliest error = %v", err)
 			}
+			t.Run("age_retention_gaps", func(t *testing.T) {
+				testStoreFetchAfterAgeRetention(t, store)
+			})
 		})
+	}
+}
+
+func testStoreFetchAfterAgeRetention(t *testing.T, store minikafka.Store) {
+	t.Helper()
+	ctx := context.Background()
+	const topic = "age_retention"
+	if err := store.CreateTopic(ctx, topic, minikafka.TopicOptions{Retention: minikafka.RetentionPolicy{MaxAge: time.Hour}}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err := store.Append(ctx, minikafka.AppendRequest{Topic: topic, Records: []minikafka.Record{
+		{Timestamp: now, Value: []byte("zero")},
+		{Timestamp: now, Value: []byte("one")},
+		{Timestamp: now.Add(-2 * time.Hour), Value: []byte("expired")},
+		{Timestamp: now, Value: []byte("three")},
+		{Timestamp: now, Value: []byte("four")},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyRetention(ctx, topic); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		offset int64
+		want   []int64
+	}{
+		{offset: 0, want: []int64{0, 1}},
+		{offset: 2, want: []int64{3, 4}},
+		{offset: 3, want: []int64{3, 4}},
+		{offset: 5},
+	} {
+		got, err := store.Fetch(ctx, minikafka.FetchRequest{Topic: topic, Offset: tc.offset})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Records) != len(tc.want) {
+			t.Fatalf("fetch at %d: records = %+v, want offsets %v", tc.offset, got.Records, tc.want)
+		}
+		for i, rec := range got.Records {
+			if rec.Offset != tc.want[i] {
+				t.Fatalf("fetch at %d: offset = %d, want %d", tc.offset, rec.Offset, tc.want[i])
+			}
+		}
+		if got.HighWatermark != 5 || got.LatestOffset != 5 || got.EarliestOffset != 0 {
+			t.Fatalf("fetch at %d: incorrect watermarks: %+v", tc.offset, got)
+		}
 	}
 }
 

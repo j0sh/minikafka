@@ -57,6 +57,9 @@ type FetchRequest struct {
 }
 
 type FetchResult struct {
+	// Records must have non-negative, ascending, contiguous offsets. If retention
+	// leaves a gap, return only the first contiguous run at or after the requested
+	// offset; a subsequent fetch can resume after the gap.
 	Records        []Record
 	HighWatermark  int64
 	EarliestOffset int64

@@ -20,6 +20,7 @@ import (
 	"github.com/segmentio/kafka-go/protocol/offsetcommit"
 	"github.com/segmentio/kafka-go/protocol/offsetfetch"
 	"github.com/segmentio/kafka-go/protocol/produce"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 const (
@@ -172,6 +173,13 @@ func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
+		if req, ok := msg.(*fetch.Request); ok {
+			res, err := b.handleFetch(ctx, req)
+			if err != nil || writeFetchResponse(conn, apiVersion, correlationID, res) != nil {
+				return
+			}
+			continue
+		}
 		res := b.handle(ctx, apiVersion, msg)
 		if res == nil {
 			continue
@@ -203,8 +211,6 @@ func (b *Broker) handle(ctx context.Context, apiVersion int16, msg protocol.Mess
 			return nil
 		}
 		return b.handleProduce(ctx, req)
-	case *fetch.Request:
-		return b.handleFetch(ctx, req)
 	case *listoffsets.Request:
 		return b.handleListOffsets(ctx, req)
 	case *findcoordinator.Request:
@@ -289,24 +295,28 @@ func (b *Broker) handleProduce(ctx context.Context, req *produce.Request) *produ
 	return res
 }
 
-func (b *Broker) handleFetch(ctx context.Context, req *fetch.Request) *fetch.Response {
-	res := &fetch.Response{}
+func (b *Broker) handleFetch(ctx context.Context, req *fetch.Request) (*kmsg.FetchResponse, error) {
+	res := kmsg.NewPtrFetchResponse()
 	for _, topicReq := range req.Topics {
-		topicRes := fetch.ResponseTopic{Topic: topicReq.Topic}
+		topicRes := kmsg.FetchResponseTopic{Topic: topicReq.Topic}
 		for _, partReq := range topicReq.Partitions {
-			partRes := b.fetchPartition(ctx, topicReq.Topic, partReq, req.MaxWaitTime)
+			partRes, err := b.fetchPartition(ctx, topicReq.Topic, partReq, req.MaxWaitTime)
+			if err != nil {
+				return nil, err
+			}
 			topicRes.Partitions = append(topicRes.Partitions, partRes)
 		}
 		res.Topics = append(res.Topics, topicRes)
 	}
-	return res
+	return res, nil
 }
 
-func (b *Broker) fetchPartition(ctx context.Context, topic string, partReq fetch.RequestPartition, maxWaitMs int32) fetch.ResponsePartition {
-	partRes := fetch.ResponsePartition{Partition: partReq.Partition, PreferredReadReplica: -1}
+func (b *Broker) fetchPartition(ctx context.Context, topic string, partReq fetch.RequestPartition, maxWaitMs int32) (kmsg.FetchResponseTopicPartition, error) {
+	partRes := kmsg.NewFetchResponseTopicPartition()
+	partRes.Partition = partReq.Partition
 	if partReq.Partition != 0 {
 		partRes.ErrorCode = kerrUnknownTopicOrPartition
-		return partRes
+		return partRes, nil
 	}
 	maxBytes := partReq.PartitionMaxBytes
 	if maxBytes <= 0 {
@@ -320,29 +330,28 @@ func (b *Broker) fetchPartition(ctx context.Context, topic string, partReq fetch
 			} else {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
 			}
-			return partRes
+			return partRes, nil
 		}
 		partRes.HighWatermark = fr.HighWatermark
 		partRes.LastStableOffset = fr.HighWatermark
 		partRes.LogStartOffset = fr.EarliestOffset
 		if len(fr.Records) > 0 || maxWaitMs <= 0 || partReq.FetchOffset < fr.LatestOffset {
-			partRes.RecordSet = kafkaRecordSet(fr.Records)
-			return partRes
+			partRes.RecordBatches, err = encodeFetchRecords(fr.Records)
+			return partRes, err
 		}
 		wait := b.registerWaiter(topic)
 		timeout := time.NewTimer(time.Duration(maxWaitMs) * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timeout.Stop()
-			return partRes
+			return partRes, nil
 		case <-b.closeCh:
 			timeout.Stop()
-			return partRes
+			return partRes, nil
 		case <-wait:
 			timeout.Stop()
 		case <-timeout.C:
-			partRes.RecordSet = kafkaRecordSet(nil)
-			return partRes
+			return partRes, nil
 		}
 	}
 }
@@ -450,28 +459,6 @@ func recordsFromKafka(rr protocol.RecordReader) ([]Record, error) {
 		}
 		records = append(records, Record{Timestamp: ts, Key: append([]byte(nil), key...), Value: append([]byte(nil), value...), Headers: headers})
 	}
-}
-
-func kafkaRecordSet(records []Record) protocol.RecordSet {
-	out := make([]protocol.Record, len(records))
-	for i, r := range records {
-		out[i] = protocol.Record{
-			Offset:  r.Offset,
-			Time:    r.Timestamp,
-			Key:     protocol.NewBytes(r.Key),
-			Value:   protocol.NewBytes(r.Value),
-			Headers: kafkaHeaders(r.Headers),
-		}
-	}
-	return protocol.RecordSet{Version: 2, Records: protocol.NewRecordReader(out...)}
-}
-
-func kafkaHeaders(headers []Header) []protocol.Header {
-	out := make([]protocol.Header, len(headers))
-	for i, h := range headers {
-		out[i] = protocol.Header{Key: h.Key, Value: append([]byte(nil), h.Value...)}
-	}
-	return out
 }
 
 func cloneHeaders(headers []Header) []Header {

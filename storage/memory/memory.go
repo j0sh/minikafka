@@ -120,6 +120,10 @@ func (s *Store) Fetch(_ context.Context, req minikafka.FetchRequest) (minikafka.
 		if rec.Offset < req.Offset {
 			continue
 		}
+		// Age-based retention can leave gaps when timestamps arrive out of order.
+		if len(out) > 0 && rec.Offset-1 != out[len(out)-1].Offset {
+			break
+		}
 		size := int32(recordSize(rec))
 		if req.MaxBytes > 0 && len(out) > 0 && bytes+size > req.MaxBytes {
 			break

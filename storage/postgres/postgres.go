@@ -159,6 +159,10 @@ func (s *Store) Fetch(ctx context.Context, req minikafka.FetchRequest) (minikafk
 		if err := rows.Scan(&rec.Offset, &ts, &rec.Key, &rec.Value, &headers, &size); err != nil {
 			return minikafka.FetchResult{}, err
 		}
+		// Return one contiguous run, even after age-based retention leaves gaps.
+		if len(records) > 0 && rec.Offset-1 != records[len(records)-1].Offset {
+			break
+		}
 		if req.MaxBytes > 0 && len(records) > 0 && total+size > req.MaxBytes {
 			break
 		}
