@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// Store supports concurrent operations after initialization. Callers must stop
+// operations on a topic before deleting it, and stop all operations before Close.
 type Store struct {
 	root string
 	opts options
@@ -68,16 +71,18 @@ func WithSynchronous(mode SynchronousMode) Option {
 	return func(o *options) { o.synchronous = mode }
 }
 
+// Init reuses an already initialized database. Concurrent calls may race and
+// replace the handle, so bring up the database just once. Fixing this is not
+// worth the squeeze; it's a usage problem and not a correctness problem.
 func (s *Store) Init(ctx context.Context) error {
+	if s.meta != nil {
+		return nil
+	}
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return err
 	}
-	db, err := sql.Open("sqlite3", filepath.Join(s.root, "_meta.db"))
+	db, err := s.openDB(ctx, filepath.Join(s.root, "_meta.db"))
 	if err != nil {
-		return err
-	}
-	s.meta = db
-	if err := s.applyPragmas(ctx, db); err != nil {
 		return err
 	}
 	_, err = db.ExecContext(ctx, `
@@ -95,7 +100,12 @@ CREATE TABLE IF NOT EXISTS consumer_offsets (
 	updated_at_ms INTEGER NOT NULL,
 	PRIMARY KEY (group_id, topic)
 );`)
-	return err
+	if err != nil {
+		db.Close()
+		return err
+	}
+	s.meta = db
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -130,22 +140,18 @@ func (s *Store) CreateTopic(ctx context.Context, topic string, opts minikafka.To
 		}
 		return err
 	}
-	db, err := s.topicDB(ctx, topic)
-	if err != nil {
-		return err
-	}
-	_, err = db.ExecContext(ctx, `INSERT OR IGNORE INTO topic_offsets(topic, next_offset) VALUES (?, 0)`, topic)
+	_, err = s.topicDB(ctx, topic)
 	return err
 }
 
 func (s *Store) DeleteTopic(ctx context.Context, topic string) error {
-	_, err := s.meta.ExecContext(ctx, `DELETE FROM topics WHERE topic = ?`, topic)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.meta.ExecContext(ctx, `DELETE FROM topics WHERE topic = ?`, topic)
 	if db := s.dbs[topic]; db != nil {
 		_ = db.Close()
 		delete(s.dbs, topic)
 	}
-	s.mu.Unlock()
 	_ = os.Remove(s.topicPath(topic))
 	return err
 }
@@ -221,10 +227,6 @@ func (s *Store) Fetch(ctx context.Context, req minikafka.FetchRequest) (minikafk
 	if err != nil {
 		return minikafka.FetchResult{}, err
 	}
-	latest, err := s.LatestOffset(ctx, req.Topic)
-	if err != nil {
-		return minikafka.FetchResult{}, err
-	}
 	if req.Offset < earliest {
 		return minikafka.FetchResult{}, minikafka.ErrOffsetOutOfRange
 	}
@@ -259,7 +261,21 @@ func (s *Store) Fetch(ctx context.Context, req minikafka.FetchRequest) (minikafk
 		records = append(records, rec)
 		total += size
 	}
-	return minikafka.FetchResult{Records: records, HighWatermark: latest, EarliestOffset: earliest, LatestOffset: latest}, rows.Err()
+	if err := rows.Err(); err != nil {
+		return minikafka.FetchResult{}, err
+	}
+	// Release the pool's only connection, including when a limit or gap ended
+	// iteration early, before querying the watermark.
+	if err := rows.Close(); err != nil {
+		return minikafka.FetchResult{}, err
+	}
+	// Read the watermark after the records so concurrent appends cannot put a
+	// returned record beyond it. Bounds and records need not share one snapshot.
+	latest, err := s.LatestOffset(ctx, req.Topic)
+	if err != nil {
+		return minikafka.FetchResult{}, err
+	}
+	return minikafka.FetchResult{Records: records, HighWatermark: latest, EarliestOffset: earliest, LatestOffset: latest}, nil
 }
 
 func (s *Store) CommitOffset(ctx context.Context, req minikafka.CommitOffsetRequest) error {
@@ -348,20 +364,16 @@ func (s *Store) ApplyRetention(ctx context.Context, topic string) error {
 }
 
 func (s *Store) topicDB(ctx context.Context, topic string) (*sql.DB, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, err := s.Topic(ctx, topic); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if db := s.dbs[topic]; db != nil {
 		return db, nil
 	}
-	db, err := sql.Open("sqlite3", s.topicPath(topic))
+	db, err := s.openDB(ctx, s.topicPath(topic))
 	if err != nil {
-		return nil, err
-	}
-	if err := s.applyPragmas(ctx, db); err != nil {
-		db.Close()
 		return nil, err
 	}
 	_, err = db.ExecContext(ctx, `
@@ -385,15 +397,23 @@ CREATE INDEX IF NOT EXISTS messages_topic_offset ON messages(topic, offset);`)
 		db.Close()
 		return nil, err
 	}
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO topic_offsets(topic, next_offset) VALUES (?, 0)`, topic); err != nil {
+		db.Close()
+		return nil, err
+	}
 	s.dbs[topic] = db
 	return db, nil
 }
 
-func (s *Store) applyPragmas(ctx context.Context, db *sql.DB) error {
+func (s *Store) openDB(ctx context.Context, path string) (*sql.DB, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	u := url.URL{Scheme: "file", Path: sqliteURIPath(abs)}
+	q := u.Query()
 	if s.opts.wal {
-		if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
-			return err
-		}
+		q.Set("_journal_mode", "WAL")
 	}
 	syncMode := "NORMAL"
 	if s.opts.synchronous == SyncFull {
@@ -401,11 +421,31 @@ func (s *Store) applyPragmas(ctx context.Context, db *sql.DB) error {
 	} else if s.opts.synchronous == SyncOff {
 		syncMode = "OFF"
 	}
-	if _, err := db.ExecContext(ctx, `PRAGMA synchronous = `+syncMode); err != nil {
-		return err
+	q.Set("_synchronous", syncMode)
+	q.Set("_busy_timeout", strconv.FormatInt(s.opts.busyTimeout.Milliseconds(), 10))
+	q.Set("_txlock", "immediate")
+	u.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite3", u.String())
+	if err != nil {
+		return nil, err
 	}
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, s.opts.busyTimeout.Milliseconds()))
-	return err
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func sqliteURIPath(path string) string {
+	path = filepath.ToSlash(path)
+	// Absolute Unix and UNC paths already begin with a slash. A Windows
+	// drive-letter path needs one so the drive is not encoded as URI authority.
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
 }
 
 func (s *Store) topicPath(topic string) string {

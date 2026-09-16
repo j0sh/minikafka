@@ -104,6 +104,9 @@ func (b *Broker) Serve(ctx context.Context) error {
 }
 
 // Close releases the listener and store, including when Serve has not started.
+// Shutdown is best-effort: Close does not close active client connections or
+// wait for in-flight requests or direct broker operations. Callers should stop
+// clients and broker operations before calling Close.
 func (b *Broker) Close() error {
 	var err error
 	b.closeOnce.Do(func() {

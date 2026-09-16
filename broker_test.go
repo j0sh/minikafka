@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,6 +129,60 @@ func TestBrokerCloseBeforeServe(t *testing.T) {
 		t.Fatal(err)
 	}
 	if store.initCalls.Load() != 0 || store.closeCalls.Load() != 1 {
+		t.Fatalf("store Init calls=%d Close calls=%d", store.initCalls.Load(), store.closeCalls.Load())
+	}
+}
+
+func TestBrokerConcurrentClose(t *testing.T) {
+	initialized := make(chan struct{})
+	store := &lifecycleStore{initFn: func(context.Context) error {
+		close(initialized)
+		return nil
+	}}
+	b, err := minikafka.Open(minikafka.Config{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- b.Serve(ctx) }()
+	select {
+	case <-initialized:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not initialize the store")
+	}
+
+	const callers = 64
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- b.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("Serve after Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not stop after Close")
+	}
+	assertListenerClosed(t, b.Addr())
+	if store.initCalls.Load() != 1 || store.closeCalls.Load() != 1 {
 		t.Fatalf("store Init calls=%d Close calls=%d", store.initCalls.Load(), store.closeCalls.Load())
 	}
 }

@@ -143,35 +143,72 @@ func testStoreFetchAfterAgeRetention(t *testing.T, store minikafka.Store) {
 }
 
 func TestStoreConcurrentAppendOffsets(t *testing.T) {
-	ctx := context.Background()
-	store := memory.Open()
-	if err := store.CreateTopic(ctx, "events", minikafka.TopicOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	const n = 64
-	var wg sync.WaitGroup
-	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			_, err := store.Append(ctx, minikafka.AppendRequest{Topic: "events", Records: []minikafka.Record{{Value: []byte(fmt.Sprintf("%d", i))}}})
-			errs <- err
-		}(i)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	latest, err := store.LatestOffset(ctx, "events")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if latest != n {
-		t.Fatalf("latest offset = %d, want %d", latest, n)
+	for _, backend := range []string{"memory", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var store minikafka.Store = memory.Open()
+			if backend == "sqlite" {
+				var err error
+				store, err = sqlite.Open(filepath.Join(t.TempDir(), "events.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer store.Close()
+			if err := store.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateTopic(ctx, "events", minikafka.TopicOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			const n = 64
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			errs := make(chan error, n)
+			offsets := make(chan int64, n)
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					app, err := store.Append(ctx, minikafka.AppendRequest{Topic: "events", Records: []minikafka.Record{{Value: []byte(fmt.Sprintf("%d", i))}}})
+					if err == nil && app.BaseOffset != app.LastOffset {
+						err = fmt.Errorf("unexpected append range: %+v", app)
+					}
+					errs <- err
+					offsets <- app.BaseOffset
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+			close(errs)
+			close(offsets)
+			for err := range errs {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			seen := make(map[int64]bool)
+			for off := range offsets {
+				if off < 0 || off >= n || seen[off] {
+					t.Fatalf("invalid or duplicate offset: %d", off)
+				}
+				seen[off] = true
+			}
+			got, err := store.Fetch(ctx, minikafka.FetchRequest{Topic: "events"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Records) != n || got.LatestOffset != n {
+				t.Fatalf("records=%d latest=%d, want %d", len(got.Records), got.LatestOffset, n)
+			}
+			for i, rec := range got.Records {
+				if rec.Offset != int64(i) {
+					t.Fatalf("record %d has offset %d", i, rec.Offset)
+				}
+			}
+		})
 	}
 }
 
