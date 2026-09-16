@@ -223,7 +223,7 @@ func (s *Store) Fetch(ctx context.Context, req minikafka.FetchRequest) (minikafk
 	if err != nil {
 		return minikafka.FetchResult{}, err
 	}
-	earliest, err := s.EarliestOffset(ctx, req.Topic)
+	earliest, err := earliestOffset(ctx, db, req.Topic)
 	if err != nil {
 		return minikafka.FetchResult{}, err
 	}
@@ -271,7 +271,7 @@ func (s *Store) Fetch(ctx context.Context, req minikafka.FetchRequest) (minikafk
 	}
 	// Read the watermark after the records so concurrent appends cannot put a
 	// returned record beyond it. Bounds and records need not share one snapshot.
-	latest, err := s.LatestOffset(ctx, req.Topic)
+	latest, err := latestOffset(ctx, db, req.Topic)
 	if err != nil {
 		return minikafka.FetchResult{}, err
 	}
@@ -303,6 +303,10 @@ func (s *Store) EarliestOffset(ctx context.Context, topic string) (int64, error)
 	if err != nil {
 		return 0, err
 	}
+	return earliestOffset(ctx, db, topic)
+}
+
+func earliestOffset(ctx context.Context, db *sql.DB, topic string) (int64, error) {
 	var next int64
 	if err := db.QueryRowContext(ctx, `SELECT next_offset FROM topic_offsets WHERE topic = ?`, topic).Scan(&next); err != nil {
 		return 0, err
@@ -322,8 +326,12 @@ func (s *Store) LatestOffset(ctx context.Context, topic string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return latestOffset(ctx, db, topic)
+}
+
+func latestOffset(ctx context.Context, db *sql.DB, topic string) (int64, error) {
 	var next int64
-	err = db.QueryRowContext(ctx, `SELECT next_offset FROM topic_offsets WHERE topic = ?`, topic).Scan(&next)
+	err := db.QueryRowContext(ctx, `SELECT next_offset FROM topic_offsets WHERE topic = ?`, topic).Scan(&next)
 	return next, err
 }
 
