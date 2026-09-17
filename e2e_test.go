@@ -243,7 +243,7 @@ func TestE2ESQLiteRestartPreservesRecordsAndClientCommit(t *testing.T) {
 		t.Fatalf("wire fetch after restart: %+v err=%v", msg, err)
 	}
 	topicDir := root[:len(root)-len(filepath.Ext(root))]
-	if matches, err := filepath.Glob(filepath.Join(topicDir, topic+".db")); err != nil || len(matches) != 1 {
+	if matches, err := filepath.Glob(filepath.Join(topicDir, "minikafka_"+topic+".db")); err != nil || len(matches) != 1 {
 		t.Fatalf("topic sqlite file matches=%v err=%v", matches, err)
 	}
 }

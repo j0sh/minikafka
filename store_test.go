@@ -234,7 +234,7 @@ func TestSQLiteRestartAndTopicFiles(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if matches, err := filepath.Glob(filepath.Join(root[:len(root)-len(filepath.Ext(root))], "billing_events.db")); err != nil || len(matches) != 1 {
+	if matches, err := filepath.Glob(filepath.Join(root[:len(root)-len(filepath.Ext(root))], "minikafka_billing_events.db")); err != nil || len(matches) != 1 {
 		t.Fatalf("topic sqlite file matches=%v err=%v", matches, err)
 	}
 

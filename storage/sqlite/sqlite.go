@@ -34,6 +34,7 @@ type options struct {
 	wal         bool
 	busyTimeout time.Duration
 	synchronous SynchronousMode
+	filePrefix  string
 }
 
 type SynchronousMode int
@@ -44,13 +45,18 @@ const (
 	SyncFull
 )
 
+const defaultFilePrefix = "minikafka_"
+
 func Open(path string, opts ...Option) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("sqlite path is required")
 	}
-	o := options{wal: true, busyTimeout: 5 * time.Second, synchronous: SyncNormal}
+	o := options{wal: true, busyTimeout: 5 * time.Second, synchronous: SyncNormal, filePrefix: defaultFilePrefix}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if strings.ContainsAny(o.filePrefix, `/\`) {
+		return nil, errors.New("sqlite file prefix must not contain path separators")
 	}
 	root := path
 	if filepath.Ext(path) != "" {
@@ -71,6 +77,12 @@ func WithSynchronous(mode SynchronousMode) Option {
 	return func(o *options) { o.synchronous = mode }
 }
 
+// WithFilePrefix configures the prefix used for metadata and topic database
+// filenames. The default is "minikafka_". An empty prefix is allowed.
+func WithFilePrefix(prefix string) Option {
+	return func(o *options) { o.filePrefix = prefix }
+}
+
 // Init reuses an already initialized database. Concurrent calls may race and
 // replace the handle, so bring up the database just once. Fixing this is not
 // worth the squeeze; it's a usage problem and not a correctness problem.
@@ -81,7 +93,7 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return err
 	}
-	db, err := s.openDB(ctx, filepath.Join(s.root, "_meta.db"))
+	db, err := s.openDB(ctx, s.metaPath())
 	if err != nil {
 		return err
 	}
@@ -456,12 +468,16 @@ func sqliteURIPath(path string) string {
 	return path
 }
 
+func (s *Store) metaPath() string {
+	return filepath.Join(s.root, s.opts.filePrefix+"+meta.db")
+}
+
 func (s *Store) topicPath(topic string) string {
 	slug := regexp.MustCompile(`[^A-Za-z0-9_.-]+`).ReplaceAllString(topic, "_")
 	if slug == "" {
 		slug = "topic"
 	}
-	return filepath.Join(s.root, slug+".db")
+	return filepath.Join(s.root, s.opts.filePrefix+slug+".db")
 }
 
 type rowScanner interface {
