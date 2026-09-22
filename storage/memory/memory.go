@@ -17,13 +17,18 @@ type Store struct {
 
 type topic struct {
 	meta       minikafka.TopicMetadata
+	partitions []partition
+}
+
+type partition struct {
 	nextOffset int64
 	records    []minikafka.Record
 }
 
 type offsetKey struct {
-	group string
-	topic string
+	group     string
+	topic     string
+	partition int32
 }
 
 func Open() *Store {
@@ -37,12 +42,19 @@ func (s *Store) Init(context.Context) error { return nil }
 func (s *Store) Close() error               { return nil }
 
 func (s *Store) CreateTopic(_ context.Context, name string, opts minikafka.TopicOptions) error {
+	if opts.Partitions < 0 {
+		return minikafka.ErrInvalidPartition
+	}
+	opts.Partitions = max(1, opts.Partitions)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.topics[name]; ok {
 		return minikafka.ErrTopicExists
 	}
-	s.topics[name] = &topic{meta: minikafka.TopicMetadata{Topic: name, CreatedAt: time.Now(), Retention: opts.Retention}}
+	s.topics[name] = &topic{
+		meta:       minikafka.TopicMetadata{Topic: name, Partitions: opts.Partitions, CreatedAt: time.Now(), Retention: opts.Retention},
+		partitions: make([]partition, opts.Partitions),
+	}
 	return nil
 }
 
@@ -86,17 +98,21 @@ func (s *Store) Append(_ context.Context, req minikafka.AppendRequest) (minikafk
 	if !ok {
 		return minikafka.AppendResult{}, minikafka.ErrTopicNotFound
 	}
-	base := t.nextOffset
+	p, err := topicPartition(t, req.Partition)
+	if err != nil {
+		return minikafka.AppendResult{}, err
+	}
+	base := p.nextOffset
 	for i := range req.Records {
 		rec := cloneRecord(req.Records[i])
 		rec.Offset = base + int64(i)
 		if rec.Timestamp.IsZero() {
 			rec.Timestamp = time.Now()
 		}
-		t.records = append(t.records, rec)
+		p.records = append(p.records, rec)
 	}
-	t.nextOffset += int64(len(req.Records))
-	return minikafka.AppendResult{BaseOffset: base, LastOffset: t.nextOffset - 1}, nil
+	p.nextOffset += int64(len(req.Records))
+	return minikafka.AppendResult{BaseOffset: base, LastOffset: p.nextOffset - 1}, nil
 }
 
 func (s *Store) Fetch(_ context.Context, req minikafka.FetchRequest) (minikafka.FetchResult, error) {
@@ -106,17 +122,21 @@ func (s *Store) Fetch(_ context.Context, req minikafka.FetchRequest) (minikafka.
 	if !ok {
 		return minikafka.FetchResult{}, minikafka.ErrTopicNotFound
 	}
-	earliest := earliest(t)
+	p, err := topicPartition(t, req.Partition)
+	if err != nil {
+		return minikafka.FetchResult{}, err
+	}
+	earliest := earliest(p)
 	if req.Offset < earliest {
 		return minikafka.FetchResult{}, minikafka.ErrOffsetOutOfRange
 	}
 	maxRecords := req.MaxRecords
 	if maxRecords <= 0 {
-		maxRecords = len(t.records)
+		maxRecords = len(p.records)
 	}
 	var out []minikafka.Record
 	var bytes int32
-	for _, rec := range t.records {
+	for _, rec := range p.records {
 		if rec.Offset < req.Offset {
 			continue
 		}
@@ -134,7 +154,7 @@ func (s *Store) Fetch(_ context.Context, req minikafka.FetchRequest) (minikafka.
 			break
 		}
 	}
-	return minikafka.FetchResult{Records: out, HighWatermark: t.nextOffset, EarliestOffset: earliest, LatestOffset: t.nextOffset}, nil
+	return minikafka.FetchResult{Records: out, HighWatermark: p.nextOffset, EarliestOffset: earliest, LatestOffset: p.nextOffset}, nil
 }
 
 func (s *Store) CommitOffset(_ context.Context, req minikafka.CommitOffsetRequest) error {
@@ -143,35 +163,53 @@ func (s *Store) CommitOffset(_ context.Context, req minikafka.CommitOffsetReques
 	if _, ok := s.topics[req.Topic]; !ok {
 		return minikafka.ErrTopicNotFound
 	}
-	s.offsets[offsetKey{group: req.GroupID, topic: req.Topic}] = req.Offset
+	if _, err := topicPartition(s.topics[req.Topic], req.Partition); err != nil {
+		return err
+	}
+	s.offsets[offsetKey{group: req.GroupID, topic: req.Topic, partition: req.Partition}] = req.Offset
 	return nil
 }
 
 func (s *Store) FetchOffset(_ context.Context, req minikafka.FetchOffsetRequest) (minikafka.FetchOffsetResult, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	off, ok := s.offsets[offsetKey{group: req.GroupID, topic: req.Topic}]
+	t, exists := s.topics[req.Topic]
+	if !exists {
+		return minikafka.FetchOffsetResult{}, minikafka.ErrTopicNotFound
+	}
+	if _, err := topicPartition(t, req.Partition); err != nil {
+		return minikafka.FetchOffsetResult{}, err
+	}
+	off, ok := s.offsets[offsetKey{group: req.GroupID, topic: req.Topic, partition: req.Partition}]
 	return minikafka.FetchOffsetResult{Offset: off, Found: ok}, nil
 }
 
-func (s *Store) EarliestOffset(_ context.Context, name string) (int64, error) {
+func (s *Store) EarliestOffset(_ context.Context, name string, partition int32) (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.topics[name]
 	if !ok {
 		return 0, minikafka.ErrTopicNotFound
 	}
-	return earliest(t), nil
+	p, err := topicPartition(t, partition)
+	if err != nil {
+		return 0, err
+	}
+	return earliest(p), nil
 }
 
-func (s *Store) LatestOffset(_ context.Context, name string) (int64, error) {
+func (s *Store) LatestOffset(_ context.Context, name string, partition int32) (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.topics[name]
 	if !ok {
 		return 0, minikafka.ErrTopicNotFound
 	}
-	return t.nextOffset, nil
+	p, err := topicPartition(t, partition)
+	if err != nil {
+		return 0, err
+	}
+	return p.nextOffset, nil
 }
 
 func (s *Store) ApplyRetention(_ context.Context, name string) error {
@@ -181,27 +219,37 @@ func (s *Store) ApplyRetention(_ context.Context, name string) error {
 	if !ok {
 		return minikafka.ErrTopicNotFound
 	}
-	p := t.meta.Retention
-	if p.MaxAge > 0 {
-		cutoff := time.Now().Add(-p.MaxAge)
-		t.records = filter(t.records, func(r minikafka.Record) bool { return !r.Timestamp.Before(cutoff) })
-	}
-	if p.MaxMessages > 0 && int64(len(t.records)) > p.MaxMessages {
-		t.records = t.records[len(t.records)-int(p.MaxMessages):]
-	}
-	if p.MaxBytes > 0 {
-		for totalSize(t.records) > p.MaxBytes && len(t.records) > 0 {
-			t.records = t.records[1:]
+	policy := t.meta.Retention
+	for i := range t.partitions {
+		p := &t.partitions[i]
+		if policy.MaxAge > 0 {
+			cutoff := time.Now().Add(-policy.MaxAge)
+			p.records = filter(p.records, func(r minikafka.Record) bool { return !r.Timestamp.Before(cutoff) })
+		}
+		if policy.MaxMessages > 0 && int64(len(p.records)) > policy.MaxMessages {
+			p.records = p.records[len(p.records)-int(policy.MaxMessages):]
+		}
+		if policy.MaxBytes > 0 {
+			for totalSize(p.records) > policy.MaxBytes && len(p.records) > 0 {
+				p.records = p.records[1:]
+			}
 		}
 	}
 	return nil
 }
 
-func earliest(t *topic) int64 {
-	if len(t.records) == 0 {
-		return t.nextOffset
+func topicPartition(t *topic, partition int32) (*partition, error) {
+	if partition < 0 || partition >= int32(len(t.partitions)) {
+		return nil, minikafka.ErrInvalidPartition
 	}
-	return t.records[0].Offset
+	return &t.partitions[partition], nil
+}
+
+func earliest(p *partition) int64 {
+	if len(p.records) == 0 {
+		return p.nextOffset
+	}
+	return p.records[0].Offset
 }
 
 func cloneRecord(r minikafka.Record) minikafka.Record {

@@ -82,6 +82,21 @@ func TestOpenBindFailureLeavesStoreUntouched(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsNegativeDefaultPartitions(t *testing.T) {
+	store := &lifecycleStore{}
+	b, err := minikafka.Open(minikafka.Config{Store: store, DefaultPartitions: -1})
+	if b != nil {
+		_ = b.Close()
+		t.Fatal("Open returned a broker for a negative default partition count")
+	}
+	if !errors.Is(err, minikafka.ErrInvalidPartition) {
+		t.Fatalf("Open error = %v", err)
+	}
+	if store.initCalls.Load() != 0 || store.closeCalls.Load() != 0 {
+		t.Fatal("Open touched the store")
+	}
+}
+
 func TestBrokerAddrStableThroughServeAndClose(t *testing.T) {
 	b := startBroker(t)
 	addr := b.Addr()

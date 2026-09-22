@@ -3,20 +3,23 @@ package minikafka
 import "time"
 
 type Config struct {
-	Addr             string
-	Store            Store
-	AutoCreateTopics bool
-	DefaultRetention RetentionPolicy
+	Addr              string
+	Store             Store
+	AutoCreateTopics  bool
+	DefaultPartitions int32
+	DefaultRetention  RetentionPolicy
 }
 
 type TopicOptions struct {
-	Retention RetentionPolicy
+	Partitions int32
+	Retention  RetentionPolicy
 }
 
 type TopicMetadata struct {
-	Topic     string
-	CreatedAt time.Time
-	Retention RetentionPolicy
+	Topic      string
+	Partitions int32
+	CreatedAt  time.Time
+	Retention  RetentionPolicy
 }
 
 type RetentionPolicy struct {

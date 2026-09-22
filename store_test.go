@@ -78,7 +78,7 @@ func TestStoresCoreSemantics(t *testing.T) {
 			if err := store.ApplyRetention(ctx, "events"); err != nil {
 				t.Fatal(err)
 			}
-			earliest, err := store.EarliestOffset(ctx, "events")
+			earliest, err := store.EarliestOffset(ctx, "events", 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -91,6 +91,129 @@ func TestStoresCoreSemantics(t *testing.T) {
 			t.Run("age_retention_gaps", func(t *testing.T) {
 				testStoreFetchAfterAgeRetention(t, store)
 			})
+		})
+	}
+}
+
+func TestStoresPartitionSemantics(t *testing.T) {
+	tests := []struct {
+		name string
+		open func(t *testing.T) minikafka.Store
+	}{
+		{name: "memory", open: func(t *testing.T) minikafka.Store { return memory.Open() }},
+		{name: "sqlite", open: func(t *testing.T) minikafka.Store {
+			store, err := sqlite.Open(filepath.Join(t.TempDir(), "partitions.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return store
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := tt.open(t)
+			if err := store.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			if err := store.CreateTopic(ctx, "default", minikafka.TopicOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			meta, err := store.Topic(ctx, "default")
+			if err != nil || meta.Partitions != 1 {
+				t.Fatalf("default topic metadata = %+v, err=%v", meta, err)
+			}
+			if err := store.CreateTopic(ctx, "invalid", minikafka.TopicOptions{Partitions: -1}); !errors.Is(err, minikafka.ErrInvalidPartition) {
+				t.Fatalf("negative partition count error = %v", err)
+			}
+
+			opts := minikafka.TopicOptions{Partitions: 2, Retention: minikafka.RetentionPolicy{MaxMessages: 1}}
+			if err := store.CreateTopic(ctx, "events_partitioned", opts); err != nil {
+				t.Fatal(err)
+			}
+			meta, err = store.Topic(ctx, "events_partitioned")
+			if err != nil || meta.Partitions != 2 {
+				t.Fatalf("partitioned topic metadata = %+v, err=%v", meta, err)
+			}
+
+			p0, err := store.Append(ctx, minikafka.AppendRequest{Topic: meta.Topic, Partition: 0, Records: []minikafka.Record{{Value: []byte("p0-zero")}, {Value: []byte("p0-one")}}})
+			if err != nil || p0.BaseOffset != 0 || p0.LastOffset != 1 {
+				t.Fatalf("partition 0 append = %+v, err=%v", p0, err)
+			}
+			p1, err := store.Append(ctx, minikafka.AppendRequest{Topic: meta.Topic, Partition: 1, Records: []minikafka.Record{{Value: []byte("p1-zero")}}})
+			if err != nil || p1.BaseOffset != 0 || p1.LastOffset != 0 {
+				t.Fatalf("partition 1 append = %+v, err=%v", p1, err)
+			}
+			for partition, want := range map[int32]string{0: "p0-zero", 1: "p1-zero"} {
+				got, err := store.Fetch(ctx, minikafka.FetchRequest{Topic: meta.Topic, Partition: partition})
+				if err != nil || len(got.Records) == 0 || string(got.Records[0].Value) != want {
+					t.Fatalf("partition %d fetch = %+v, err=%v", partition, got, err)
+				}
+			}
+
+			for partition, offset := range map[int32]int64{0: 7, 1: 9} {
+				if err := store.CommitOffset(ctx, minikafka.CommitOffsetRequest{GroupID: "g", Topic: meta.Topic, Partition: partition, Offset: offset}); err != nil {
+					t.Fatal(err)
+				}
+				got, err := store.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "g", Topic: meta.Topic, Partition: partition})
+				if err != nil || !got.Found || got.Offset != offset {
+					t.Fatalf("partition %d committed offset = %+v, err=%v", partition, got, err)
+				}
+			}
+
+			if err := store.ApplyRetention(ctx, meta.Topic); err != nil {
+				t.Fatal(err)
+			}
+			if earliest, err := store.EarliestOffset(ctx, meta.Topic, 0); err != nil || earliest != 1 {
+				t.Fatalf("partition 0 earliest after retention = %d, err=%v", earliest, err)
+			}
+			if earliest, err := store.EarliestOffset(ctx, meta.Topic, 1); err != nil || earliest != 0 {
+				t.Fatalf("partition 1 earliest after retention = %d, err=%v", earliest, err)
+			}
+
+			invalidOps := []func() error{
+				func() error {
+					_, err := store.Append(ctx, minikafka.AppendRequest{Topic: meta.Topic, Partition: 2})
+					return err
+				},
+				func() error {
+					_, err := store.Fetch(ctx, minikafka.FetchRequest{Topic: meta.Topic, Partition: -1})
+					return err
+				},
+				func() error { _, err := store.EarliestOffset(ctx, meta.Topic, 2); return err },
+				func() error { _, err := store.LatestOffset(ctx, meta.Topic, -1); return err },
+				func() error {
+					return store.CommitOffset(ctx, minikafka.CommitOffsetRequest{GroupID: "g", Topic: meta.Topic, Partition: 2})
+				},
+				func() error {
+					_, err := store.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "g", Topic: meta.Topic, Partition: 2})
+					return err
+				},
+			}
+			for i, op := range invalidOps {
+				if err := op(); !errors.Is(err, minikafka.ErrInvalidPartition) {
+					t.Fatalf("invalid partition operation %d error = %v", i, err)
+				}
+			}
+
+			if err := store.DeleteTopic(ctx, meta.Topic); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateTopic(ctx, meta.Topic, minikafka.TopicOptions{Partitions: 2}); err != nil {
+				t.Fatal(err)
+			}
+			for partition := int32(0); partition < 2; partition++ {
+				if latest, err := store.LatestOffset(ctx, meta.Topic, partition); err != nil || latest != 0 {
+					t.Fatalf("partition %d latest after recreation = %d, err=%v", partition, latest, err)
+				}
+				got, err := store.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "g", Topic: meta.Topic, Partition: partition})
+				if err != nil || got.Found {
+					t.Fatalf("partition %d offset survived recreation: %+v, err=%v", partition, got, err)
+				}
+			}
 		})
 	}
 }
@@ -222,19 +345,20 @@ func TestSQLiteRestartAndTopicFiles(t *testing.T) {
 	if err := store.Init(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateTopic(ctx, "billing_events", minikafka.TopicOptions{}); err != nil {
+	if err := store.CreateTopic(ctx, "billing_events", minikafka.TopicOptions{Partitions: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(ctx, minikafka.AppendRequest{Topic: "billing_events", Records: []minikafka.Record{{Value: []byte("durable")}}}); err != nil {
+	if _, err := store.Append(ctx, minikafka.AppendRequest{Topic: "billing_events", Partition: 1, Records: []minikafka.Record{{Value: []byte("durable")}}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CommitOffset(ctx, minikafka.CommitOffsetRequest{GroupID: "g", Topic: "billing_events", Offset: 1}); err != nil {
+	if err := store.CommitOffset(ctx, minikafka.CommitOffsetRequest{GroupID: "g", Topic: "billing_events", Partition: 1, Offset: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if matches, err := filepath.Glob(filepath.Join(root[:len(root)-len(filepath.Ext(root))], "minikafka_billing_events.db")); err != nil || len(matches) != 1 {
+	topicGlob := filepath.Join(root[:len(root)-len(filepath.Ext(root))], "minikafka_billing_events_*.db")
+	if matches, err := filepath.Glob(topicGlob); err != nil || len(matches) != 2 {
 		t.Fatalf("topic sqlite file matches=%v err=%v", matches, err)
 	}
 
@@ -246,18 +370,28 @@ func TestSQLiteRestartAndTopicFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	latest, err := reopened.LatestOffset(ctx, "billing_events")
+	meta, err := reopened.Topic(ctx, "billing_events")
+	if err != nil || meta.Partitions != 2 {
+		t.Fatalf("topic metadata after restart = %+v, err=%v", meta, err)
+	}
+	latest, err := reopened.LatestOffset(ctx, "billing_events", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if latest != 1 {
 		t.Fatalf("latest after restart = %d", latest)
 	}
-	off, err := reopened.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "g", Topic: "billing_events"})
+	off, err := reopened.FetchOffset(ctx, minikafka.FetchOffsetRequest{GroupID: "g", Topic: "billing_events", Partition: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !off.Found || off.Offset != 1 {
 		t.Fatalf("offset after restart = %+v", off)
+	}
+	if err := reopened.DeleteTopic(ctx, "billing_events"); err != nil {
+		t.Fatal(err)
+	}
+	if matches, err := filepath.Glob(topicGlob); err != nil || len(matches) != 0 {
+		t.Fatalf("topic files after deleting reopened topic=%v err=%v", matches, err)
 	}
 }

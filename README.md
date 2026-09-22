@@ -26,11 +26,16 @@ if err != nil {
 }
 
 broker, err := minikafka.Open(minikafka.Config{
-	Addr:             "127.0.0.1:9092",
-	Store:            store,
-	AutoCreateTopics: true,
+	Addr:              "127.0.0.1:9092",
+	Store:             store,
+	AutoCreateTopics:  true,
+	DefaultPartitions: 3,
 })
 ```
+
+SQLite stores topic data in one database per partition. With the default `minikafka`
+prefix, partition 0 of the `events` topic is stored in
+`minikafka_events_0.db`, partition 1 in `minikafka_events_1.db`, and so on.
 
 ## In-Memory Backend
 
@@ -89,6 +94,7 @@ Topics can be created explicitly:
 
 ```go
 err := broker.CreateTopic(ctx, "events", minikafka.TopicOptions{
+	Partitions: 3,
 	Retention: minikafka.RetentionPolicy{
 		MaxMessages: 10000,
 	},
@@ -96,9 +102,22 @@ err := broker.CreateTopic(ctx, "events", minikafka.TopicOptions{
 ```
 
 When `AutoCreateTopics` is enabled, producing to an unknown topic or requesting
-metadata for it creates the topic with `DefaultRetention`. This mirrors Kafka's
-common broker-level auto-create behavior. When `AutoCreateTopics` is disabled,
+metadata for it creates the topic with `DefaultPartitions` and
+`DefaultRetention`. A zero partition count defaults to one. Partition counts
+are fixed when the topic is created. When `AutoCreateTopics` is disabled,
 unknown topics return Kafka's `UNKNOWN_TOPIC_OR_PARTITION` error.
+
+Kafka clients select a partition before sending a Produce request. The direct
+`Publish` helper uses Kafka-compatible Murmur2 hashing for keys and random
+selection for records without a key. Use `PublishToPartition` when the caller
+must choose a partition explicitly:
+
+```go
+offset, err := broker.PublishToPartition(ctx, "events", 2, key, value)
+```
+
+Offsets are local to a partition: each partition starts at offset 0 and advances
+independently. Retention limits are also applied independently to each partition.
 
 `DefaultRetention` is a `RetentionPolicy` applied to auto-created topics. Its
 zero value has no limits: records are retained forever unless a topic-specific
@@ -123,13 +142,13 @@ Kafka clients. The broker also exposes `ResetConsumerOffset` as a direct helper
 for tests and embedded administration code:
 
 ```go
-err := broker.ResetConsumerOffset(ctx, "group-a", "events", 42)
+err := broker.ResetConsumerOffset(ctx, "group-a", "events", 2, 42)
 ```
 
 ## Limitations
 
 - Single broker only
-- Single-partition topic semantics
+- Fixed partition counts; no partition expansion or reassignment
 - Focused Kafka protocol subset for common produce, fetch, metadata, list
   offsets, and offset commit/fetch flows
 - Intended to feel like Kafka without the distributed-system pieces: no broker

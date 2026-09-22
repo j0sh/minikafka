@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	kafka "github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/protocol"
 	"github.com/segmentio/kafka-go/protocol/apiversions"
 	"github.com/segmentio/kafka-go/protocol/fetch"
@@ -39,7 +40,12 @@ type Broker struct {
 	closeCh   chan struct{}
 	closeOnce sync.Once
 	waitMu    sync.Mutex
-	waiters   map[string][]chan struct{}
+	waiters   map[topicPartition]map[chan struct{}]struct{}
+}
+
+type topicPartition struct {
+	topic     string
+	partition int32
 }
 
 // Open binds the configured TCP address synchronously. The caller must Close the
@@ -47,6 +53,12 @@ type Broker struct {
 func Open(cfg Config) (*Broker, error) {
 	if cfg.Store == nil {
 		return nil, ErrNoStoreConfigured
+	}
+	if cfg.DefaultPartitions < 0 {
+		return nil, ErrInvalidPartition
+	}
+	if cfg.DefaultPartitions == 0 {
+		cfg.DefaultPartitions = 1
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = "127.0.0.1:0"
@@ -64,7 +76,7 @@ func Open(cfg Config) (*Broker, error) {
 		host:    host,
 		port:    port,
 		closeCh: make(chan struct{}),
-		waiters: make(map[string][]chan struct{}),
+		waiters: make(map[topicPartition]map[chan struct{}]struct{}),
 	}, nil
 }
 
@@ -111,7 +123,6 @@ func (b *Broker) Close() error {
 	var err error
 	b.closeOnce.Do(func() {
 		close(b.closeCh)
-		b.wakeAll()
 		err = b.ln.Close()
 		if storeErr := b.cfg.Store.Close(); err == nil {
 			err = storeErr
@@ -121,6 +132,12 @@ func (b *Broker) Close() error {
 }
 
 func (b *Broker) CreateTopic(ctx context.Context, topic string, opts TopicOptions) error {
+	if opts.Partitions < 0 {
+		return ErrInvalidPartition
+	}
+	if opts.Partitions == 0 {
+		opts.Partitions = 1
+	}
 	return b.cfg.Store.CreateTopic(ctx, topic, opts)
 }
 
@@ -145,15 +162,31 @@ func (b *Broker) ApplyRetention(ctx context.Context) error {
 	return nil
 }
 
-func (b *Broker) ResetConsumerOffset(ctx context.Context, groupID, topic string, offset int64) error {
-	return b.cfg.Store.CommitOffset(ctx, CommitOffsetRequest{GroupID: groupID, Topic: topic, Offset: offset})
+func (b *Broker) ResetConsumerOffset(ctx context.Context, groupID, topic string, partition int32, offset int64) error {
+	return b.cfg.Store.CommitOffset(ctx, CommitOffsetRequest{GroupID: groupID, Topic: topic, Partition: partition, Offset: offset})
 }
 
 func (b *Broker) Publish(ctx context.Context, topic string, key, value []byte, headers ...Header) (int64, error) {
 	if err := b.ensureTopic(ctx, topic); err != nil {
 		return 0, err
 	}
-	res, err := b.cfg.Store.Append(ctx, AppendRequest{Topic: topic, Records: []Record{{
+	meta, err := b.cfg.Store.Topic(ctx, topic)
+	if err != nil {
+		return 0, err
+	}
+	partitions := make([]int, meta.Partitions)
+	for i := range partitions {
+		partitions[i] = i
+	}
+	partition := int32((kafka.Murmur2Balancer{}).Balance(kafka.Message{Key: key, Value: value}, partitions...))
+	return b.PublishToPartition(ctx, topic, partition, key, value, headers...)
+}
+
+func (b *Broker) PublishToPartition(ctx context.Context, topic string, partition int32, key, value []byte, headers ...Header) (int64, error) {
+	if err := b.ensureTopic(ctx, topic); err != nil {
+		return 0, err
+	}
+	res, err := b.cfg.Store.Append(ctx, AppendRequest{Topic: topic, Partition: partition, Records: []Record{{
 		Timestamp: time.Now(),
 		Key:       append([]byte(nil), key...),
 		Value:     append([]byte(nil), value...),
@@ -162,7 +195,7 @@ func (b *Broker) Publish(ctx context.Context, topic string, key, value []byte, h
 	if err != nil {
 		return 0, err
 	}
-	b.wake(topic)
+	b.wake(topic, partition)
 	return res.BaseOffset, nil
 }
 
@@ -248,13 +281,20 @@ func (b *Broker) handleMetadata(ctx context.Context, req *metadata.Request) *met
 		}
 		t := metadata.ResponseTopic{ErrorCode: errCode, Name: name}
 		if errCode == kerrNone {
-			t.Partitions = []metadata.ResponsePartition{{
-				PartitionIndex: 0,
-				LeaderID:       1,
-				LeaderEpoch:    0,
-				ReplicaNodes:   []int32{1},
-				IsrNodes:       []int32{1},
-			}}
+			meta, err := b.cfg.Store.Topic(ctx, name)
+			if err != nil {
+				t.ErrorCode = kerrUnknownTopicOrPartition
+			} else {
+				for partition := int32(0); partition < meta.Partitions; partition++ {
+					t.Partitions = append(t.Partitions, metadata.ResponsePartition{
+						PartitionIndex: partition,
+						LeaderID:       1,
+						LeaderEpoch:    0,
+						ReplicaNodes:   []int32{1},
+						IsrNodes:       []int32{1},
+					})
+				}
+			}
 		}
 		res.Topics = append(res.Topics, t)
 	}
@@ -267,11 +307,6 @@ func (b *Broker) handleProduce(ctx context.Context, req *produce.Request) *produ
 		topicRes := produce.ResponseTopic{Topic: topicReq.Topic}
 		for _, partReq := range topicReq.Partitions {
 			partRes := produce.ResponsePartition{Partition: partReq.Partition, BaseOffset: -1}
-			if partReq.Partition != 0 {
-				partRes.ErrorCode = kerrUnknownTopicOrPartition
-				topicRes.Partitions = append(topicRes.Partitions, partRes)
-				continue
-			}
 			if err := b.ensureTopic(ctx, topicReq.Topic); err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
 				topicRes.Partitions = append(topicRes.Partitions, partRes)
@@ -283,14 +318,14 @@ func (b *Broker) handleProduce(ctx context.Context, req *produce.Request) *produ
 				topicRes.Partitions = append(topicRes.Partitions, partRes)
 				continue
 			}
-			app, err := b.cfg.Store.Append(ctx, AppendRequest{Topic: topicReq.Topic, Records: records})
+			app, err := b.cfg.Store.Append(ctx, AppendRequest{Topic: topicReq.Topic, Partition: partReq.Partition, Records: records})
 			if err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
 				topicRes.Partitions = append(topicRes.Partitions, partRes)
 				continue
 			}
 			partRes.BaseOffset = app.BaseOffset
-			b.wake(topicReq.Topic)
+			b.wake(topicReq.Topic, partReq.Partition)
 			topicRes.Partitions = append(topicRes.Partitions, partRes)
 		}
 		res.Topics = append(res.Topics, topicRes)
@@ -299,64 +334,67 @@ func (b *Broker) handleProduce(ctx context.Context, req *produce.Request) *produ
 }
 
 func (b *Broker) handleFetch(ctx context.Context, req *fetch.Request) (*kmsg.FetchResponse, error) {
-	res := kmsg.NewPtrFetchResponse()
-	for _, topicReq := range req.Topics {
-		topicRes := kmsg.FetchResponseTopic{Topic: topicReq.Topic}
-		for _, partReq := range topicReq.Partitions {
-			partRes, err := b.fetchPartition(ctx, topicReq.Topic, partReq, req.MaxWaitTime)
-			if err != nil {
-				return nil, err
+	deadline := time.Now().Add(time.Duration(req.MaxWaitTime) * time.Millisecond)
+	// Subscribe before reading so an append between a read and the wait is seen.
+	wait, unregister := b.registerWaiter(req)
+	defer unregister()
+	timeout := time.NewTimer(time.Until(deadline))
+	defer timeout.Stop()
+	for {
+		res := kmsg.NewPtrFetchResponse()
+		var size int64
+		var partitions int
+		var failed bool
+		for _, topicReq := range req.Topics {
+			topicRes := kmsg.FetchResponseTopic{Topic: topicReq.Topic}
+			for _, partReq := range topicReq.Partitions {
+				partRes, err := b.fetchPartition(ctx, topicReq.Topic, partReq)
+				if err != nil {
+					return nil, err
+				}
+				topicRes.Partitions = append(topicRes.Partitions, partRes)
+				size += int64(len(partRes.RecordBatches))
+				partitions++
+				failed = failed || partRes.ErrorCode != kerrNone
 			}
-			topicRes.Partitions = append(topicRes.Partitions, partRes)
+			res.Topics = append(res.Topics, topicRes)
 		}
-		res.Topics = append(res.Topics, topicRes)
+		if failed || partitions == 0 || size >= int64(req.MinBytes) || !time.Now().Before(deadline) {
+			return res, nil
+		}
+		select {
+		case <-ctx.Done():
+			return res, nil
+		case <-b.closeCh:
+			return res, nil
+		case <-wait:
+		case <-timeout.C:
+			// Read once more at the deadline to return the latest available data.
+		}
 	}
-	return res, nil
 }
 
-func (b *Broker) fetchPartition(ctx context.Context, topic string, partReq fetch.RequestPartition, maxWaitMs int32) (kmsg.FetchResponseTopicPartition, error) {
+func (b *Broker) fetchPartition(ctx context.Context, topic string, partReq fetch.RequestPartition) (kmsg.FetchResponseTopicPartition, error) {
 	partRes := kmsg.NewFetchResponseTopicPartition()
 	partRes.Partition = partReq.Partition
-	if partReq.Partition != 0 {
-		partRes.ErrorCode = kerrUnknownTopicOrPartition
-		return partRes, nil
-	}
 	maxBytes := partReq.PartitionMaxBytes
 	if maxBytes <= 0 {
 		maxBytes = 1 << 20
 	}
-	for {
-		fr, err := b.cfg.Store.Fetch(ctx, FetchRequest{Topic: topic, Offset: partReq.FetchOffset, MaxBytes: maxBytes, MaxRecords: 1000})
-		if err != nil {
-			if errors.Is(err, ErrOffsetOutOfRange) {
-				partRes.ErrorCode = kerrOffsetOutOfRange
-			} else {
-				partRes.ErrorCode = kerrUnknownTopicOrPartition
-			}
-			return partRes, nil
+	fr, err := b.cfg.Store.Fetch(ctx, FetchRequest{Topic: topic, Partition: partReq.Partition, Offset: partReq.FetchOffset, MaxBytes: maxBytes, MaxRecords: 1000})
+	if err != nil {
+		if errors.Is(err, ErrOffsetOutOfRange) {
+			partRes.ErrorCode = kerrOffsetOutOfRange
+		} else {
+			partRes.ErrorCode = kerrUnknownTopicOrPartition
 		}
-		partRes.HighWatermark = fr.HighWatermark
-		partRes.LastStableOffset = fr.HighWatermark
-		partRes.LogStartOffset = fr.EarliestOffset
-		if len(fr.Records) > 0 || maxWaitMs <= 0 || partReq.FetchOffset < fr.LatestOffset {
-			partRes.RecordBatches, err = encodeFetchRecords(fr.Records)
-			return partRes, err
-		}
-		wait := b.registerWaiter(topic)
-		timeout := time.NewTimer(time.Duration(maxWaitMs) * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timeout.Stop()
-			return partRes, nil
-		case <-b.closeCh:
-			timeout.Stop()
-			return partRes, nil
-		case <-wait:
-			timeout.Stop()
-		case <-timeout.C:
-			return partRes, nil
-		}
+		return partRes, nil
 	}
+	partRes.HighWatermark = fr.HighWatermark
+	partRes.LastStableOffset = fr.HighWatermark
+	partRes.LogStartOffset = fr.EarliestOffset
+	partRes.RecordBatches, err = encodeFetchRecords(fr.Records)
+	return partRes, err
 }
 
 func (b *Broker) handleListOffsets(ctx context.Context, req *listoffsets.Request) *listoffsets.Response {
@@ -365,17 +403,17 @@ func (b *Broker) handleListOffsets(ctx context.Context, req *listoffsets.Request
 		topicRes := listoffsets.ResponseTopic{Topic: topicReq.Topic}
 		for _, partReq := range topicReq.Partitions {
 			partRes := listoffsets.ResponsePartition{Partition: partReq.Partition, Timestamp: partReq.Timestamp, LeaderEpoch: -1}
-			if partReq.Partition != 0 {
+			var err error
+			switch partReq.Timestamp {
+			case -2:
+				partRes.Offset, err = b.cfg.Store.EarliestOffset(ctx, topicReq.Topic, partReq.Partition)
+			case -1:
+				partRes.Offset, err = b.cfg.Store.LatestOffset(ctx, topicReq.Topic, partReq.Partition)
+			default:
+				partRes.Offset, err = b.cfg.Store.EarliestOffset(ctx, topicReq.Topic, partReq.Partition)
+			}
+			if err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
-			} else {
-				switch partReq.Timestamp {
-				case -2:
-					partRes.Offset, _ = b.cfg.Store.EarliestOffset(ctx, topicReq.Topic)
-				case -1:
-					partRes.Offset, _ = b.cfg.Store.LatestOffset(ctx, topicReq.Topic)
-				default:
-					partRes.Offset, _ = b.cfg.Store.EarliestOffset(ctx, topicReq.Topic)
-				}
 			}
 			topicRes.Partitions = append(topicRes.Partitions, partRes)
 		}
@@ -390,9 +428,7 @@ func (b *Broker) handleOffsetCommit(ctx context.Context, req *offsetcommit.Reque
 		topicRes := offsetcommit.ResponseTopic{Name: topicReq.Name}
 		for _, partReq := range topicReq.Partitions {
 			partRes := offsetcommit.ResponsePartition{PartitionIndex: partReq.PartitionIndex}
-			if partReq.PartitionIndex != 0 {
-				partRes.ErrorCode = kerrUnknownTopicOrPartition
-			} else if err := b.cfg.Store.CommitOffset(ctx, CommitOffsetRequest{GroupID: req.GroupID, Topic: topicReq.Name, Offset: partReq.CommittedOffset}); err != nil {
+			if err := b.cfg.Store.CommitOffset(ctx, CommitOffsetRequest{GroupID: req.GroupID, Topic: topicReq.Name, Partition: partReq.PartitionIndex, Offset: partReq.CommittedOffset}); err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
 			}
 			topicRes.Partitions = append(topicRes.Partitions, partRes)
@@ -408,9 +444,10 @@ func (b *Broker) handleOffsetFetch(ctx context.Context, req *offsetfetch.Request
 		topicRes := offsetfetch.ResponseTopic{Name: topicReq.Name}
 		for _, part := range topicReq.PartitionIndexes {
 			partRes := offsetfetch.ResponsePartition{PartitionIndex: part, CommittedOffset: -1}
-			if part != 0 {
+			off, err := b.cfg.Store.FetchOffset(ctx, FetchOffsetRequest{GroupID: req.GroupID, Topic: topicReq.Name, Partition: part})
+			if err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
-			} else if off, err := b.cfg.Store.FetchOffset(ctx, FetchOffsetRequest{GroupID: req.GroupID, Topic: topicReq.Name}); err == nil && off.Found {
+			} else if off.Found {
 				partRes.CommittedOffset = off.Offset
 			}
 			topicRes.Partitions = append(topicRes.Partitions, partRes)
@@ -427,7 +464,7 @@ func (b *Broker) ensureTopic(ctx context.Context, topic string) error {
 	if !b.cfg.AutoCreateTopics {
 		return ErrTopicNotFound
 	}
-	err := b.cfg.Store.CreateTopic(ctx, topic, TopicOptions{Retention: b.cfg.DefaultRetention})
+	err := b.cfg.Store.CreateTopic(ctx, topic, TopicOptions{Partitions: b.cfg.DefaultPartitions, Retention: b.cfg.DefaultRetention})
 	if errors.Is(err, ErrTopicExists) {
 		return nil
 	}
@@ -484,32 +521,42 @@ func splitAddr(addr string) (string, int32) {
 	return host, int32(port)
 }
 
-func (b *Broker) registerWaiter(topic string) chan struct{} {
-	ch := make(chan struct{})
+func (b *Broker) registerWaiter(req *fetch.Request) (chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
 	b.waitMu.Lock()
-	b.waiters[topic] = append(b.waiters[topic], ch)
+	for _, topic := range req.Topics {
+		for _, part := range topic.Partitions {
+			key := topicPartition{topic: topic.Topic, partition: part.Partition}
+			if b.waiters[key] == nil {
+				b.waiters[key] = make(map[chan struct{}]struct{})
+			}
+			b.waiters[key][ch] = struct{}{}
+		}
+	}
 	b.waitMu.Unlock()
-	return ch
-}
-
-func (b *Broker) wake(topic string) {
-	b.waitMu.Lock()
-	waiters := b.waiters[topic]
-	delete(b.waiters, topic)
-	b.waitMu.Unlock()
-	for _, ch := range waiters {
-		close(ch)
+	return ch, func() {
+		b.waitMu.Lock()
+		defer b.waitMu.Unlock()
+		for _, topic := range req.Topics {
+			for _, part := range topic.Partitions {
+				key := topicPartition{topic: topic.Topic, partition: part.Partition}
+				delete(b.waiters[key], ch)
+				if len(b.waiters[key]) == 0 {
+					delete(b.waiters, key)
+				}
+			}
+		}
 	}
 }
 
-func (b *Broker) wakeAll() {
+func (b *Broker) wake(topic string, partition int32) {
 	b.waitMu.Lock()
 	defer b.waitMu.Unlock()
-	for topic, waiters := range b.waiters {
-		for _, ch := range waiters {
-			close(ch)
+	for ch := range b.waiters[topicPartition{topic: topic, partition: partition}] {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
-		delete(b.waiters, topic)
 	}
 }
 

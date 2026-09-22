@@ -20,8 +20,8 @@ type Store interface {
 	CommitOffset(ctx context.Context, req CommitOffsetRequest) error
 	FetchOffset(ctx context.Context, req FetchOffsetRequest) (FetchOffsetResult, error)
 
-	EarliestOffset(ctx context.Context, topic string) (int64, error)
-	LatestOffset(ctx context.Context, topic string) (int64, error)
+	EarliestOffset(ctx context.Context, topic string, partition int32) (int64, error)
+	LatestOffset(ctx context.Context, topic string, partition int32) (int64, error)
 
 	ApplyRetention(ctx context.Context, topic string) error
 }
@@ -40,8 +40,9 @@ type Header struct {
 }
 
 type AppendRequest struct {
-	Topic   string
-	Records []Record
+	Topic     string
+	Partition int32
+	Records   []Record
 }
 
 type AppendResult struct {
@@ -51,6 +52,7 @@ type AppendResult struct {
 
 type FetchRequest struct {
 	Topic      string
+	Partition  int32
 	Offset     int64
 	MaxBytes   int32
 	MaxRecords int
@@ -67,14 +69,16 @@ type FetchResult struct {
 }
 
 type CommitOffsetRequest struct {
-	GroupID string
-	Topic   string
-	Offset  int64
+	GroupID   string
+	Topic     string
+	Partition int32
+	Offset    int64
 }
 
 type FetchOffsetRequest struct {
-	GroupID string
-	Topic   string
+	GroupID   string
+	Topic     string
+	Partition int32
 }
 
 type FetchOffsetResult struct {
