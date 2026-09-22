@@ -205,7 +205,7 @@ func TestStoresPartitionSemantics(t *testing.T) {
 			if err := store.CreateTopic(ctx, meta.Topic, minikafka.TopicOptions{Partitions: 2}); err != nil {
 				t.Fatal(err)
 			}
-			for partition := int32(0); partition < 2; partition++ {
+			for partition := range int32(2) {
 				if latest, err := store.LatestOffset(ctx, meta.Topic, partition); err != nil || latest != 0 {
 					t.Fatalf("partition %d latest after recreation = %d, err=%v", partition, latest, err)
 				}
@@ -290,7 +290,7 @@ func TestStoreConcurrentAppendOffsets(t *testing.T) {
 			start := make(chan struct{})
 			errs := make(chan error, n)
 			offsets := make(chan int64, n)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()

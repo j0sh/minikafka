@@ -153,7 +153,7 @@ func TestConnectionSettingsSurviveReplacement(t *testing.T) {
 					if db.Stats().MaxOpenConnections != 1 {
 						t.Fatal("expected a one-connection pool")
 					}
-					for attempt := 0; attempt < 2; attempt++ {
+					for attempt := range 2 {
 						conn, err := db.Conn(ctx)
 						if err != nil {
 							t.Fatal(err)
@@ -216,8 +216,8 @@ func TestTransactionsAcquireWriterLockAtBegin(t *testing.T) {
 				other.Rollback()
 				t.Fatal("second transaction began before the first released the writer lock")
 			}
-			var busy sqlite3.Error
-			if !errors.As(err, &busy) || busy.Code != sqlite3.ErrBusy {
+			busy, ok := errors.AsType[sqlite3.Error](err)
+			if !ok || busy.Code != sqlite3.ErrBusy {
 				t.Fatalf("expected SQLITE_BUSY at BEGIN, got %v", err)
 			}
 			if err := tx.Rollback(); err != nil {
@@ -309,7 +309,7 @@ func TestConcurrentCreateAndAppend(t *testing.T) {
 	start := make(chan struct{})
 	errs := make(chan error, 2*n)
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
+	for i := range n {
 		topic := fmt.Sprintf("events_%d", i)
 		wg.Add(2)
 		go func() {
@@ -338,7 +338,7 @@ func TestConcurrentCreateAndAppend(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if next, err := s.LatestOffset(ctx, fmt.Sprintf("events_%d", i), 0); err != nil || next != 1 {
 			t.Fatalf("topic %d: next=%d err=%v", i, next, err)
 		}
@@ -359,7 +359,7 @@ func TestFetchDuringAppends(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			if _, err := s.Append(ctx, minikafka.AppendRequest{Topic: "events", Records: []minikafka.Record{{}}}); err != nil {
 				t.Error(err)
 				return
@@ -370,7 +370,7 @@ func TestFetchDuringAppends(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			for i := 0; i < 100; i++ {
+			for range 100 {
 				got, err := s.Fetch(ctx, minikafka.FetchRequest{Topic: "events", MaxBytes: maxBytes})
 				if err != nil {
 					t.Error(err)

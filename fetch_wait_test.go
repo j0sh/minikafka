@@ -2,6 +2,7 @@ package minikafka
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -55,10 +56,8 @@ func TestFetchRequestWaiting(t *testing.T) {
 					if req.Partition == 2 && tc.err != nil {
 						return FetchResult{}, tc.err
 					}
-					for _, p := range tc.populated {
-						if req.Partition == p {
-							return FetchResult{Records: []Record{{Value: make([]byte, 100)}}, HighWatermark: 1}, nil
-						}
+					if slices.Contains(tc.populated, req.Partition) {
+						return FetchResult{Records: []Record{{Value: make([]byte, 100)}}, HighWatermark: 1}, nil
 					}
 					return FetchResult{}, nil
 				})
@@ -132,7 +131,7 @@ func TestFetchWakeDoesNotExtendDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		b, req := newFetchTestBroker(func(FetchRequest) (FetchResult, error) { return FetchResult{}, nil })
 		go func() {
-			for i := 0; i < 3; i++ {
+			for range 3 {
 				time.Sleep(300 * time.Millisecond)
 				b.wake("events", 2)
 			}

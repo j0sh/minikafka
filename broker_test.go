@@ -103,7 +103,7 @@ func TestBrokerAddrStableThroughServeAndClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for i := 0; i < 10000; i++ {
+		for range 10000 {
 			if got := b.Addr(); got != addr {
 				t.Errorf("Addr changed from %q to %q", addr, got)
 				return
@@ -158,8 +158,7 @@ func TestBrokerConcurrentClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- b.Serve(ctx) }()
 	select {
@@ -173,12 +172,10 @@ func TestBrokerConcurrentClose(t *testing.T) {
 	errs := make(chan error, callers)
 	var wg sync.WaitGroup
 	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			errs <- b.Close()
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
