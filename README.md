@@ -88,6 +88,43 @@ Connections can queue on the bound listener before initialization finishes, but
 requests are handled only afterward. Binding does not mean the store is ready for
 direct access. `Close` releases both the listener and the store.
 
+## Authentication
+
+`Config.SASL` enables authentication for Kafka TCP clients; nil leaves it disabled.
+An empty `Mechanisms` list defaults to SCRAM-SHA-512:
+
+```go
+broker, err := minikafka.Open(minikafka.Config{
+	Store: memory.Open(),
+	SASL: &minikafka.SASLConfig{
+		Users: map[string]string{"app": "app-secret"},
+	},
+})
+```
+
+For PLAIN only, set `Mechanisms: []minikafka.SASLMechanism{minikafka.SASLPlain}`.
+To accept both, list `minikafka.SASLSCRAMSHA512` and `minikafka.SASLPlain`.
+They share `Users`; `Open` copies the settings, so credential changes require
+a new broker.
+
+With `kafka-go` and `github.com/segmentio/kafka-go/sasl/scram`:
+
+```go
+mechanism, err := scram.Mechanism(scram.SHA512, "app", "app-secret")
+if err != nil {
+	log.Fatal(err)
+}
+dialer := &kafka.Dialer{SASLMechanism: mechanism}
+```
+
+Use the dialer for readers and connections, or set `kafka.Transport.SASL` to the
+same mechanism for writers. For PLAIN, use `plain.Mechanism` from
+`kafka-go/sasl/plain` with `Username` and `Password`.
+
+TCP is unencrypted. PLAIN sends passwords in clear text; use a trusted network
+or protected transport such as a TLS proxy. Direct in-process broker calls bypass
+SASL.
+
 ## Topics, Retention, and Offsets
 
 Topics can be created explicitly:

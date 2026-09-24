@@ -21,6 +21,8 @@ import (
 	"github.com/segmentio/kafka-go/protocol/offsetcommit"
 	"github.com/segmentio/kafka-go/protocol/offsetfetch"
 	"github.com/segmentio/kafka-go/protocol/produce"
+	"github.com/segmentio/kafka-go/protocol/saslauthenticate"
+	"github.com/segmentio/kafka-go/protocol/saslhandshake"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -33,6 +35,7 @@ const (
 
 type Broker struct {
 	cfg       Config
+	auth      *brokerAuth
 	ln        net.Listener
 	addr      string
 	host      string
@@ -57,6 +60,12 @@ func Open(cfg Config) (*Broker, error) {
 	if cfg.DefaultPartitions < 0 {
 		return nil, ErrInvalidPartition
 	}
+	auth, err := newBrokerAuth(cfg.SASL)
+	if err != nil {
+		return nil, err
+	}
+	// Authentication uses its own immutable copy of the credentials.
+	cfg.SASL = nil
 	if cfg.DefaultPartitions == 0 {
 		cfg.DefaultPartitions = 1
 	}
@@ -71,6 +80,7 @@ func Open(cfg Config) (*Broker, error) {
 	host, port := splitAddr(addr)
 	return &Broker{
 		cfg:     cfg,
+		auth:    auth,
 		ln:      ln,
 		addr:    addr,
 		host:    host,
@@ -201,6 +211,9 @@ func (b *Broker) PublishToPartition(ctx context.Context, topic string, partition
 
 func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	if b.auth != nil && !b.authenticateConn(ctx, conn) {
+		return
+	}
 	for {
 		apiVersion, correlationID, _, msg, err := protocol.ReadRequest(conn)
 		if err != nil {
@@ -216,6 +229,13 @@ func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 			}
 			continue
 		}
+		if _, ok := msg.(*saslhandshake.Request); ok {
+			_ = protocol.WriteResponse(conn, apiVersion, correlationID, &saslhandshake.Response{ErrorCode: kerrUnsupportedSASLMechanism})
+			return
+		}
+		if _, ok := msg.(*saslauthenticate.Request); ok {
+			return
+		}
 		res := b.handle(ctx, apiVersion, msg)
 		if res == nil {
 			continue
@@ -229,7 +249,7 @@ func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 func (b *Broker) handle(ctx context.Context, apiVersion int16, msg protocol.Message) protocol.Message {
 	switch req := msg.(type) {
 	case *apiversions.Request:
-		return &apiversions.Response{ApiKeys: []apiversions.ApiKeyResponse{
+		keys := []apiversions.ApiKeyResponse{
 			{ApiKey: int16(protocol.ApiVersions), MinVersion: 0, MaxVersion: 2},
 			{ApiKey: int16(protocol.Metadata), MinVersion: 0, MaxVersion: 8},
 			{ApiKey: int16(protocol.Produce), MinVersion: 0, MaxVersion: 8},
@@ -238,7 +258,14 @@ func (b *Broker) handle(ctx context.Context, apiVersion int16, msg protocol.Mess
 			{ApiKey: int16(protocol.FindCoordinator), MinVersion: 0, MaxVersion: 2},
 			{ApiKey: int16(protocol.OffsetCommit), MinVersion: 0, MaxVersion: 7},
 			{ApiKey: int16(protocol.OffsetFetch), MinVersion: 0, MaxVersion: 5},
-		}}
+		}
+		if b.auth != nil {
+			keys = append(keys,
+				apiversions.ApiKeyResponse{ApiKey: int16(protocol.SaslHandshake), MinVersion: 0, MaxVersion: 1},
+				apiversions.ApiKeyResponse{ApiKey: int16(protocol.SaslAuthenticate), MinVersion: 0, MaxVersion: 1},
+			)
+		}
+		return &apiversions.Response{ApiKeys: keys}
 	case *metadata.Request:
 		return b.handleMetadata(ctx, req)
 	case *produce.Request:

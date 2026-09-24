@@ -8,4 +8,5 @@ var (
 	ErrInvalidPartition  = errors.New("invalid partition")
 	ErrOffsetOutOfRange  = errors.New("offset out of range")
 	ErrNoStoreConfigured = errors.New("no store configured")
+	ErrInvalidSASLConfig = errors.New("invalid SASL config")
 )
