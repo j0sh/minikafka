@@ -439,6 +439,35 @@ func TestSASLRejectsRequestsBeforeAuthentication(t *testing.T) {
 	}
 }
 
+func TestSASLAuthenticationDeadline(t *testing.T) {
+	b := startBrokerWithConfig(t, minikafka.Config{Store: memory.Open(), SASL: &minikafka.SASLConfig{
+		Mechanisms: []minikafka.SASLMechanism{minikafka.SASLPlain}, Users: map[string]string{"alice": "secret"},
+	}})
+	// Authenticate first so this connection's original deadline expires before
+	// the stalled connections below are closed.
+	authenticated := authTestConn(t, b.Addr())
+	authTestExchange(t, authenticated, 1, &saslhandshake.Request{Mechanism: "PLAIN"})
+	res := authTestExchange(t, authenticated, 0, &saslauthenticate.Request{AuthBytes: []byte("\x00alice\x00secret")}).(*saslauthenticate.Response)
+	if res.ErrorCode != 0 {
+		t.Fatalf("authenticate = %+v", res)
+	}
+	silent := authTestConn(t, b.Addr())
+	partial := authTestConn(t, b.Addr())
+	for _, conn := range []net.Conn{authenticated, silent, partial} {
+		if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One client sends nothing; the other declares a frame and stalls mid-frame.
+	if _, err := partial.Write([]byte{0, 0, 0, 12}); err != nil {
+		t.Fatal(err)
+	}
+	assertAuthConnectionClosed(t, silent)
+	assertAuthConnectionClosed(t, partial)
+	// Successful authentication must clear both deadlines for normal traffic.
+	authTestExchange(t, authenticated, 0, &metadata.Request{})
+}
+
 func authTestConn(t *testing.T, addr string) net.Conn {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, time.Second)

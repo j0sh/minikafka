@@ -12,6 +12,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/segmentio/kafka-go/protocol"
 	"github.com/segmentio/kafka-go/protocol/apiversions"
@@ -27,6 +28,7 @@ const (
 	scramIterations                    = 4096
 	maxSASLTokenBytes                  = 1 << 20
 	maxSASLRequestBytes                = maxSASLTokenBytes + 4096
+	saslAuthenticationTimeout          = 10 * time.Second
 )
 
 type brokerAuth struct {
@@ -174,6 +176,10 @@ func decodeSCRAMName(encoded string) (string, error) {
 
 // authenticateConn handles the Kafka requests allowed before authentication.
 func (b *Broker) authenticateConn(ctx context.Context, conn net.Conn) (string, bool) {
+	if err := conn.SetDeadline(time.Now().Add(saslAuthenticationTimeout)); err != nil {
+		return "", false
+	}
+	defer conn.SetDeadline(time.Time{})
 	for {
 		version, correlationID, msg, err := readAuthRequest(conn)
 		if err != nil {
