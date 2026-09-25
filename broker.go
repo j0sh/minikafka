@@ -27,23 +27,25 @@ import (
 )
 
 const (
-	kerrNone                    int16 = 0
-	kerrOffsetOutOfRange        int16 = 1
-	kerrUnknownTopicOrPartition int16 = 3
-	kerrUnsupportedVersion      int16 = 35
+	kerrNone                     int16 = 0
+	kerrOffsetOutOfRange         int16 = 1
+	kerrUnknownTopicOrPartition  int16 = 3
+	kerrTopicAuthorizationFailed int16 = 29
+	kerrUnsupportedVersion       int16 = 35
 )
 
 type Broker struct {
-	cfg       Config
-	auth      *brokerAuth
-	ln        net.Listener
-	addr      string
-	host      string
-	port      int32
-	closeCh   chan struct{}
-	closeOnce sync.Once
-	waitMu    sync.Mutex
-	waiters   map[topicPartition]map[chan struct{}]struct{}
+	cfg           Config
+	auth          *brokerAuth
+	authorization authorizationPolicy
+	ln            net.Listener
+	addr          string
+	host          string
+	port          int32
+	closeCh       chan struct{}
+	closeOnce     sync.Once
+	waitMu        sync.Mutex
+	waiters       map[topicPartition]map[chan struct{}]struct{}
 }
 
 type topicPartition struct {
@@ -64,8 +66,13 @@ func Open(cfg Config) (*Broker, error) {
 	if err != nil {
 		return nil, err
 	}
+	authorization, err := newAuthorizationPolicy(cfg.Authorization, cfg.SASL)
+	if err != nil {
+		return nil, err
+	}
 	// Authentication uses its own immutable copy of the credentials.
 	cfg.SASL = nil
+	cfg.Authorization = nil
 	if cfg.DefaultPartitions == 0 {
 		cfg.DefaultPartitions = 1
 	}
@@ -79,14 +86,15 @@ func Open(cfg Config) (*Broker, error) {
 	addr := ln.Addr().String()
 	host, port := splitAddr(addr)
 	return &Broker{
-		cfg:     cfg,
-		auth:    auth,
-		ln:      ln,
-		addr:    addr,
-		host:    host,
-		port:    port,
-		closeCh: make(chan struct{}),
-		waiters: make(map[topicPartition]map[chan struct{}]struct{}),
+		cfg:           cfg,
+		auth:          auth,
+		authorization: authorization,
+		ln:            ln,
+		addr:          addr,
+		host:          host,
+		port:          port,
+		closeCh:       make(chan struct{}),
+		waiters:       make(map[topicPartition]map[chan struct{}]struct{}),
 	}, nil
 }
 
@@ -211,8 +219,13 @@ func (b *Broker) PublishToPartition(ctx context.Context, topic string, partition
 
 func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	if b.auth != nil && !b.authenticateConn(ctx, conn) {
-		return
+	var principal string
+	if b.auth != nil {
+		var ok bool
+		principal, ok = b.authenticateConn(ctx, conn)
+		if !ok {
+			return
+		}
 	}
 	for {
 		apiVersion, correlationID, _, msg, err := protocol.ReadRequest(conn)
@@ -223,7 +236,7 @@ func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		if req, ok := msg.(*fetch.Request); ok {
-			res, err := b.handleFetch(ctx, req)
+			res, err := b.handleFetch(ctx, principal, req)
 			if err != nil || writeFetchResponse(conn, apiVersion, correlationID, res) != nil {
 				return
 			}
@@ -236,8 +249,16 @@ func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 		if _, ok := msg.(*saslauthenticate.Request); ok {
 			return
 		}
-		res := b.handle(ctx, apiVersion, msg)
-		if res == nil {
+		res := b.handle(ctx, apiVersion, principal, msg)
+		if req, ok := msg.(*produce.Request); ok && req.Acks == 0 {
+			// With no response expected, close the connection to signal any error.
+			for _, topic := range res.(*produce.Response).Topics {
+				for _, partition := range topic.Partitions {
+					if partition.ErrorCode != kerrNone {
+						return
+					}
+				}
+			}
 			continue
 		}
 		if err := protocol.WriteResponse(conn, apiVersion, correlationID, res); err != nil {
@@ -246,7 +267,7 @@ func (b *Broker) serveConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (b *Broker) handle(ctx context.Context, apiVersion int16, msg protocol.Message) protocol.Message {
+func (b *Broker) handle(ctx context.Context, apiVersion int16, principal string, msg protocol.Message) protocol.Message {
 	switch req := msg.(type) {
 	case *apiversions.Request:
 		keys := []apiversions.ApiKeyResponse{
@@ -267,29 +288,26 @@ func (b *Broker) handle(ctx context.Context, apiVersion int16, msg protocol.Mess
 		}
 		return &apiversions.Response{ApiKeys: keys}
 	case *metadata.Request:
-		return b.handleMetadata(ctx, req)
+		return b.handleMetadata(ctx, apiVersion, principal, req)
 	case *produce.Request:
-		if req.Acks == 0 {
-			_ = b.handleProduce(ctx, req)
-			return nil
-		}
-		return b.handleProduce(ctx, req)
+		return b.handleProduce(ctx, principal, req)
 	case *listoffsets.Request:
-		return b.handleListOffsets(ctx, req)
+		return b.handleListOffsets(ctx, principal, req)
 	case *findcoordinator.Request:
 		return &findcoordinator.Response{NodeID: 1, Host: b.host, Port: b.port}
 	case *offsetcommit.Request:
-		return b.handleOffsetCommit(ctx, req)
+		return b.handleOffsetCommit(ctx, principal, req)
 	case *offsetfetch.Request:
-		return b.handleOffsetFetch(ctx, req)
+		return b.handleOffsetFetch(ctx, principal, req)
 	default:
 		_ = apiVersion
 		return &apiversions.Response{ErrorCode: kerrUnsupportedVersion}
 	}
 }
 
-func (b *Broker) handleMetadata(ctx context.Context, req *metadata.Request) *metadata.Response {
+func (b *Broker) handleMetadata(ctx context.Context, apiVersion int16, principal string, req *metadata.Request) *metadata.Response {
 	names := req.TopicNames
+	allTopics := names == nil
 	if names == nil {
 		topics, _ := b.cfg.Store.ListTopics(ctx)
 		for _, topic := range topics {
@@ -302,8 +320,17 @@ func (b *Broker) handleMetadata(ctx context.Context, req *metadata.Request) *met
 		ControllerID: 1,
 	}
 	for _, name := range names {
+		canRead := b.authorization.allows(principal, name, permissionRead)
+		canWrite := b.authorization.allows(principal, name, permissionWrite)
+		if !canRead && !canWrite {
+			if !allTopics {
+				res.Topics = append(res.Topics, metadata.ResponseTopic{ErrorCode: kerrTopicAuthorizationFailed, Name: name})
+			}
+			continue
+		}
+		allowCreate := canWrite && (apiVersion < 4 || req.AllowAutoTopicCreation)
 		errCode := kerrNone
-		if err := b.ensureTopic(ctx, name); err != nil {
+		if err := b.ensureTopicWithCreation(ctx, name, allowCreate); err != nil {
 			errCode = kerrUnknownTopicOrPartition
 		}
 		t := metadata.ResponseTopic{ErrorCode: errCode, Name: name}
@@ -328,12 +355,17 @@ func (b *Broker) handleMetadata(ctx context.Context, req *metadata.Request) *met
 	return res
 }
 
-func (b *Broker) handleProduce(ctx context.Context, req *produce.Request) *produce.Response {
+func (b *Broker) handleProduce(ctx context.Context, principal string, req *produce.Request) *produce.Response {
 	res := &produce.Response{}
 	for _, topicReq := range req.Topics {
 		topicRes := produce.ResponseTopic{Topic: topicReq.Topic}
 		for _, partReq := range topicReq.Partitions {
 			partRes := produce.ResponsePartition{Partition: partReq.Partition, BaseOffset: -1}
+			if !b.authorization.allows(principal, topicReq.Topic, permissionWrite) {
+				partRes.ErrorCode = kerrTopicAuthorizationFailed
+				topicRes.Partitions = append(topicRes.Partitions, partRes)
+				continue
+			}
 			if err := b.ensureTopic(ctx, topicReq.Topic); err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
 				topicRes.Partitions = append(topicRes.Partitions, partRes)
@@ -360,7 +392,7 @@ func (b *Broker) handleProduce(ctx context.Context, req *produce.Request) *produ
 	return res
 }
 
-func (b *Broker) handleFetch(ctx context.Context, req *fetch.Request) (*kmsg.FetchResponse, error) {
+func (b *Broker) handleFetch(ctx context.Context, principal string, req *fetch.Request) (*kmsg.FetchResponse, error) {
 	deadline := time.Now().Add(time.Duration(req.MaxWaitTime) * time.Millisecond)
 	// Subscribe before reading so an append between a read and the wait is seen.
 	wait, unregister := b.registerWaiter(req)
@@ -375,7 +407,7 @@ func (b *Broker) handleFetch(ctx context.Context, req *fetch.Request) (*kmsg.Fet
 		for _, topicReq := range req.Topics {
 			topicRes := kmsg.FetchResponseTopic{Topic: topicReq.Topic}
 			for _, partReq := range topicReq.Partitions {
-				partRes, err := b.fetchPartition(ctx, topicReq.Topic, partReq)
+				partRes, err := b.fetchPartition(ctx, principal, topicReq.Topic, partReq)
 				if err != nil {
 					return nil, err
 				}
@@ -401,9 +433,13 @@ func (b *Broker) handleFetch(ctx context.Context, req *fetch.Request) (*kmsg.Fet
 	}
 }
 
-func (b *Broker) fetchPartition(ctx context.Context, topic string, partReq fetch.RequestPartition) (kmsg.FetchResponseTopicPartition, error) {
+func (b *Broker) fetchPartition(ctx context.Context, principal, topic string, partReq fetch.RequestPartition) (kmsg.FetchResponseTopicPartition, error) {
 	partRes := kmsg.NewFetchResponseTopicPartition()
 	partRes.Partition = partReq.Partition
+	if !b.authorization.allows(principal, topic, permissionRead) {
+		partRes.ErrorCode = kerrTopicAuthorizationFailed
+		return partRes, nil
+	}
 	maxBytes := partReq.PartitionMaxBytes
 	if maxBytes <= 0 {
 		maxBytes = 1 << 20
@@ -424,12 +460,18 @@ func (b *Broker) fetchPartition(ctx context.Context, topic string, partReq fetch
 	return partRes, err
 }
 
-func (b *Broker) handleListOffsets(ctx context.Context, req *listoffsets.Request) *listoffsets.Response {
+func (b *Broker) handleListOffsets(ctx context.Context, principal string, req *listoffsets.Request) *listoffsets.Response {
 	res := &listoffsets.Response{}
 	for _, topicReq := range req.Topics {
 		topicRes := listoffsets.ResponseTopic{Topic: topicReq.Topic}
 		for _, partReq := range topicReq.Partitions {
 			partRes := listoffsets.ResponsePartition{Partition: partReq.Partition, Timestamp: partReq.Timestamp, LeaderEpoch: -1}
+			if !b.authorization.allows(principal, topicReq.Topic, permissionRead) {
+				partRes.ErrorCode = kerrTopicAuthorizationFailed
+				partRes.Offset = -1
+				topicRes.Partitions = append(topicRes.Partitions, partRes)
+				continue
+			}
 			var err error
 			switch partReq.Timestamp {
 			case -2:
@@ -449,12 +491,17 @@ func (b *Broker) handleListOffsets(ctx context.Context, req *listoffsets.Request
 	return res
 }
 
-func (b *Broker) handleOffsetCommit(ctx context.Context, req *offsetcommit.Request) *offsetcommit.Response {
+func (b *Broker) handleOffsetCommit(ctx context.Context, principal string, req *offsetcommit.Request) *offsetcommit.Response {
 	res := &offsetcommit.Response{}
 	for _, topicReq := range req.Topics {
 		topicRes := offsetcommit.ResponseTopic{Name: topicReq.Name}
 		for _, partReq := range topicReq.Partitions {
 			partRes := offsetcommit.ResponsePartition{PartitionIndex: partReq.PartitionIndex}
+			if !b.authorization.allows(principal, topicReq.Name, permissionRead) {
+				partRes.ErrorCode = kerrTopicAuthorizationFailed
+				topicRes.Partitions = append(topicRes.Partitions, partRes)
+				continue
+			}
 			if err := b.cfg.Store.CommitOffset(ctx, CommitOffsetRequest{GroupID: req.GroupID, Topic: topicReq.Name, Partition: partReq.PartitionIndex, Offset: partReq.CommittedOffset}); err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
 			}
@@ -465,12 +512,17 @@ func (b *Broker) handleOffsetCommit(ctx context.Context, req *offsetcommit.Reque
 	return res
 }
 
-func (b *Broker) handleOffsetFetch(ctx context.Context, req *offsetfetch.Request) *offsetfetch.Response {
+func (b *Broker) handleOffsetFetch(ctx context.Context, principal string, req *offsetfetch.Request) *offsetfetch.Response {
 	res := &offsetfetch.Response{}
 	for _, topicReq := range req.Topics {
 		topicRes := offsetfetch.ResponseTopic{Name: topicReq.Name}
 		for _, part := range topicReq.PartitionIndexes {
 			partRes := offsetfetch.ResponsePartition{PartitionIndex: part, CommittedOffset: -1}
+			if !b.authorization.allows(principal, topicReq.Name, permissionRead) {
+				partRes.ErrorCode = kerrTopicAuthorizationFailed
+				topicRes.Partitions = append(topicRes.Partitions, partRes)
+				continue
+			}
 			off, err := b.cfg.Store.FetchOffset(ctx, FetchOffsetRequest{GroupID: req.GroupID, Topic: topicReq.Name, Partition: part})
 			if err != nil {
 				partRes.ErrorCode = kerrUnknownTopicOrPartition
@@ -485,10 +537,14 @@ func (b *Broker) handleOffsetFetch(ctx context.Context, req *offsetfetch.Request
 }
 
 func (b *Broker) ensureTopic(ctx context.Context, topic string) error {
+	return b.ensureTopicWithCreation(ctx, topic, true)
+}
+
+func (b *Broker) ensureTopicWithCreation(ctx context.Context, topic string, allowCreate bool) error {
 	if _, err := b.cfg.Store.Topic(ctx, topic); err == nil {
 		return nil
 	}
-	if !b.cfg.AutoCreateTopics {
+	if !b.cfg.AutoCreateTopics || !allowCreate {
 		return ErrTopicNotFound
 	}
 	err := b.cfg.Store.CreateTopic(ctx, topic, TopicOptions{Partitions: b.cfg.DefaultPartitions, Retention: b.cfg.DefaultRetention})

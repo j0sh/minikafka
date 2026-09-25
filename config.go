@@ -6,6 +6,7 @@ type Config struct {
 	Addr              string
 	Store             Store
 	SASL              *SASLConfig
+	Authorization     *AuthorizationConfig
 	AutoCreateTopics  bool
 	DefaultPartitions int32
 	DefaultRetention  RetentionPolicy
@@ -24,6 +25,28 @@ const (
 type SASLConfig struct {
 	Mechanisms []SASLMechanism
 	Users      map[string]string
+}
+
+// AuthorizationConfig enables deny-by-default topic permissions for SASL users.
+// A nil config leaves Kafka TCP clients unrestricted. Open copies the grants.
+type AuthorizationConfig struct {
+	Grants []TopicGrant
+}
+
+type TopicAction string
+
+const (
+	TopicRead  TopicAction = "read"
+	TopicWrite TopicAction = "write"
+	TopicAll   TopicAction = "all"
+)
+
+// TopicGrant permits an action on a topic. "*" matches every user or topic;
+// TopicAll permits both read and write. Grants are additive.
+type TopicGrant struct {
+	User   string
+	Topic  string
+	Action TopicAction
 }
 
 type TopicOptions struct {

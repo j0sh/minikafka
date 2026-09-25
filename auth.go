@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 
 	"github.com/segmentio/kafka-go/protocol"
@@ -31,6 +32,7 @@ const (
 type brokerAuth struct {
 	mechanisms []SASLMechanism
 	users      map[string]string
+	scramUsers map[string]string
 	scram      *scram.Server
 }
 
@@ -62,12 +64,13 @@ func newBrokerAuth(cfg *SASLConfig) (*brokerAuth, error) {
 	if len(cfg.Users) == 0 {
 		return nil, fmt.Errorf("%w: at least one user is required", ErrInvalidSASLConfig)
 	}
-	auth := &brokerAuth{mechanisms: append([]SASLMechanism(nil), mechanisms...)}
+	auth := &brokerAuth{mechanisms: slices.Clone(mechanisms)}
 	if plainEnabled {
 		auth.users = make(map[string]string, len(cfg.Users))
 	}
 	if scramEnabled {
 		credentials := make(map[string]scram.StoredCredentials, len(cfg.Users))
+		auth.scramUsers = make(map[string]string, len(cfg.Users))
 		for user, password := range cfg.Users {
 			if err := validateSASLUser(user, password); err != nil {
 				return nil, err
@@ -95,6 +98,7 @@ func newBrokerAuth(cfg *SASLConfig) (*brokerAuth, error) {
 				return nil, fmt.Errorf("%w: derive SCRAM credentials for %q", ErrInvalidSASLConfig, user)
 			}
 			credentials[preparedUser] = credential
+			auth.scramUsers[preparedUser] = user
 		}
 		server, err := scram.SHA512.NewServer(func(user string) (scram.StoredCredentials, error) {
 			preparedUser, err := decodeSCRAMName(user)
@@ -126,12 +130,7 @@ func newBrokerAuth(cfg *SASLConfig) (*brokerAuth, error) {
 }
 
 func (a *brokerAuth) supports(mechanism SASLMechanism) bool {
-	for _, enabled := range a.mechanisms {
-		if enabled == mechanism {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(a.mechanisms, mechanism)
 }
 
 func (a *brokerAuth) mechanismNames() []string {
@@ -174,11 +173,11 @@ func decodeSCRAMName(encoded string) (string, error) {
 }
 
 // authenticateConn handles the Kafka requests allowed before authentication.
-func (b *Broker) authenticateConn(ctx context.Context, conn net.Conn) bool {
+func (b *Broker) authenticateConn(ctx context.Context, conn net.Conn) (string, bool) {
 	for {
 		version, correlationID, msg, err := readAuthRequest(conn)
 		if err != nil {
-			return false
+			return "", false
 		}
 		switch req := msg.(type) {
 		case *apiversions.Request:
@@ -191,12 +190,12 @@ func (b *Broker) authenticateConn(ctx context.Context, conn net.Conn) bool {
 						ApiKey: int16(protocol.ApiVersions), MinVersion: 0, MaxVersion: 2,
 					}},
 				}); err != nil {
-					return false
+					return "", false
 				}
 				continue
 			}
-			if err := protocol.WriteResponse(conn, version, correlationID, b.handle(ctx, version, req)); err != nil {
-				return false
+			if err := protocol.WriteResponse(conn, version, correlationID, b.handle(ctx, version, "", req)); err != nil {
+				return "", false
 			}
 		case *saslhandshake.Request:
 			mechanism := SASLMechanism(req.Mechanism)
@@ -205,19 +204,19 @@ func (b *Broker) authenticateConn(ctx context.Context, conn net.Conn) bool {
 					ErrorCode:  kerrUnsupportedSASLMechanism,
 					Mechanisms: b.auth.mechanismNames(),
 				})
-				return false
+				return "", false
 			}
 			if err := protocol.WriteResponse(conn, version, correlationID, &saslhandshake.Response{
 				Mechanisms: b.auth.mechanismNames(),
 			}); err != nil {
-				return false
+				return "", false
 			}
 			if version == 0 {
 				return b.authenticateRaw(conn, mechanism)
 			}
 			return b.authenticateFramed(conn, mechanism)
 		default:
-			return false
+			return "", false
 		}
 	}
 }
@@ -226,6 +225,7 @@ type saslConversation struct {
 	auth      *brokerAuth
 	mechanism SASLMechanism
 	scram     *scram.ServerConversation
+	user      string
 }
 
 func (a *brokerAuth) newConversation(mechanism SASLMechanism) saslConversation {
@@ -253,6 +253,7 @@ func (c *saslConversation) step(token []byte) (response []byte, done bool, err e
 		if !ok || subtle.ConstantTimeCompare([]byte(password), parts[2]) != 1 {
 			return nil, false, errors.New("invalid credentials")
 		}
+		c.user = user
 		return nil, true, nil
 	}
 	responseString, err := c.scram.Step(string(token))
@@ -269,19 +270,30 @@ func (c *saslConversation) step(token []byte) (response []byte, done bool, err e
 			return nil, false, errors.New("authorization identity differs from username")
 		}
 	}
-	return []byte(responseString), c.scram.Done() && c.scram.Valid(), nil
+	if c.scram.Done() && c.scram.Valid() {
+		prepared, err := stringprep.SASLprep.Prepare(user)
+		if err != nil {
+			return nil, false, err
+		}
+		c.user = c.auth.scramUsers[prepared]
+		if c.user == "" {
+			return nil, false, errors.New("unknown user")
+		}
+		return []byte(responseString), true, nil
+	}
+	return []byte(responseString), false, nil
 }
 
-func (b *Broker) authenticateFramed(conn net.Conn, mechanism SASLMechanism) bool {
+func (b *Broker) authenticateFramed(conn net.Conn, mechanism SASLMechanism) (string, bool) {
 	conversation := b.auth.newConversation(mechanism)
 	for {
 		version, correlationID, msg, err := readAuthRequest(conn)
 		if err != nil {
-			return false
+			return "", false
 		}
 		req, ok := msg.(*saslauthenticate.Request)
 		if !ok {
-			return false
+			return "", false
 		}
 		response, done, err := conversation.step(req.AuthBytes)
 		res := &saslauthenticate.Response{AuthBytes: response}
@@ -290,42 +302,42 @@ func (b *Broker) authenticateFramed(conn net.Conn, mechanism SASLMechanism) bool
 			res.ErrorMessage = "SASL authentication failed"
 		}
 		if writeErr := protocol.WriteResponse(conn, version, correlationID, res); writeErr != nil || err != nil {
-			return false
+			return "", false
 		}
 		if done {
-			return true
+			return conversation.user, true
 		}
 	}
 }
 
-func (b *Broker) authenticateRaw(conn net.Conn, mechanism SASLMechanism) bool {
+func (b *Broker) authenticateRaw(conn net.Conn, mechanism SASLMechanism) (string, bool) {
 	conversation := b.auth.newConversation(mechanism)
 	for {
 		var length [4]byte
 		if _, err := io.ReadFull(conn, length[:]); err != nil {
-			return false
+			return "", false
 		}
 		size := binary.BigEndian.Uint32(length[:])
 		if size > maxSASLTokenBytes {
-			return false
+			return "", false
 		}
 		token := make([]byte, size)
 		if _, err := io.ReadFull(conn, token); err != nil {
-			return false
+			return "", false
 		}
 		response, done, err := conversation.step(token)
 		if err != nil {
-			return false
+			return "", false
 		}
 		binary.BigEndian.PutUint32(length[:], uint32(len(response)))
 		if err := writeAll(conn, length[:]); err != nil {
-			return false
+			return "", false
 		}
 		if err := writeAll(conn, response); err != nil {
-			return false
+			return "", false
 		}
 		if done {
-			return true
+			return conversation.user, true
 		}
 	}
 }

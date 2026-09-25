@@ -105,7 +105,7 @@ broker, err := minikafka.Open(minikafka.Config{
 For PLAIN only, set `Mechanisms: []minikafka.SASLMechanism{minikafka.SASLPlain}`.
 To accept both, list `minikafka.SASLSCRAMSHA512` and `minikafka.SASLPlain`.
 They share `Users`; `Open` copies the settings, so credential changes require
-a new broker.
+a broker restart.
 
 With `kafka-go` and `github.com/segmentio/kafka-go/sasl/scram`:
 
@@ -124,6 +124,31 @@ same mechanism for writers. For PLAIN, use `plain.Mechanism` from
 TCP is unencrypted. PLAIN sends passwords in clear text; use a trusted network
 or protected transport such as a TLS proxy. Direct in-process broker calls bypass
 SASL.
+
+## Topic Permissions
+
+Set `Config.Authorization` to restrict Kafka TCP clients by SASL username. A nil
+authorization config leaves access unrestricted, while a non-nil config is
+default deny unless listed. SASL is required when authorization is enabled.
+
+```go
+broker, err := minikafka.Open(minikafka.Config{
+	Store: memory.Open(),
+	SASL: &minikafka.SASLConfig{Users: map[string]string{
+		"app": "app-secret", "reader": "reader-secret", "admin": "admin-secret",
+	}},
+	Authorization: &minikafka.AuthorizationConfig{Grants: []minikafka.TopicGrant{
+		{User: "app", Topic: "events", Action: minikafka.TopicWrite},
+		{User: "reader", Topic: "events", Action: minikafka.TopicRead},
+		{User: "*", Topic: "public", Action: minikafka.TopicRead},
+		{User: "admin", Topic: "*", Action: minikafka.TopicAll},
+	}},
+})
+```
+
+`*` matches all users or topics. `TopicAll` grants both read and write; matching
+grants combine. Either action allows metadata reads for topics the user can read
+or write. Authorization changes require a broker restart.
 
 ## Topics, Retention, and Offsets
 

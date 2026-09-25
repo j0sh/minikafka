@@ -63,7 +63,7 @@ func TestFetchRequestWaiting(t *testing.T) {
 				})
 				req.MinBytes, req.MaxWaitTime = tc.minBytes, tc.maxWait
 				start := time.Now()
-				res, err := b.handleFetch(context.Background(), req)
+				res, err := b.handleFetch(context.Background(), "", req)
 				if err != nil || time.Since(start) != tc.elapsed {
 					t.Fatalf("fetch elapsed=%s, want %s, err=%v", time.Since(start), tc.elapsed, err)
 				}
@@ -84,6 +84,32 @@ func TestFetchRequestWaiting(t *testing.T) {
 	}
 }
 
+func TestFetchAuthorizationFailureDoesNotWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, req := newFetchTestBroker(func(req FetchRequest) (FetchResult, error) {
+			if req.Topic != "events" {
+				t.Errorf("unauthorized fetch reached store: %+v", req)
+			}
+			return FetchResult{}, nil
+		})
+		b.authorization = authorizationPolicy{{"alice", "events"}: permissionRead}
+		req.Topics = append(req.Topics, fetch.RequestTopic{
+			Topic: "hidden", Partitions: []fetch.RequestPartition{{Partition: 0}},
+		})
+		start := time.Now()
+		res, err := b.handleFetch(t.Context(), "alice", req)
+		if err != nil || time.Since(start) != 0 {
+			t.Fatalf("denied fetch waited: elapsed=%s, err=%v", time.Since(start), err)
+		}
+		if len(res.Topics) != 2 || res.Topics[0].Partitions[0].ErrorCode != kerrNone || res.Topics[1].Partitions[0].ErrorCode != kerrTopicAuthorizationFailed {
+			t.Fatalf("unexpected response: %+v", res)
+		}
+		if len(b.waiters) != 0 {
+			t.Fatalf("remaining waiter keys=%d", len(b.waiters))
+		}
+	})
+}
+
 func TestFetchWakeups(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var records [3][]Record
@@ -97,7 +123,7 @@ func TestFetchWakeups(t *testing.T) {
 			copy := *req
 			copy.MinBytes = int32(1 + i*249)
 			go func() {
-				res, err := b.handleFetch(context.Background(), &copy)
+				res, err := b.handleFetch(context.Background(), "", &copy)
 				if err != nil {
 					t.Error(err)
 				}
@@ -137,7 +163,7 @@ func TestFetchWakeDoesNotExtendDeadline(t *testing.T) {
 			}
 		}()
 		start := time.Now()
-		if _, err := b.handleFetch(context.Background(), req); err != nil || time.Since(start) != time.Second {
+		if _, err := b.handleFetch(context.Background(), "", req); err != nil || time.Since(start) != time.Second {
 			t.Fatalf("fetch elapsed=%s, err=%v", time.Since(start), err)
 		}
 	})
@@ -159,7 +185,7 @@ func TestFetchAppendDuringRead(t *testing.T) {
 			return FetchResult{}, nil
 		})
 		start := time.Now()
-		res, err := b.handleFetch(context.Background(), req)
+		res, err := b.handleFetch(context.Background(), "", req)
 		if err != nil || time.Since(start) != 0 || len(res.Topics[0].Partitions[2].RecordBatches) == 0 {
 			t.Fatalf("missed append: elapsed=%s, err=%v", time.Since(start), err)
 		}
@@ -175,7 +201,7 @@ func TestFetchCancellation(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				if _, err := b.handleFetch(ctx, req); err != nil {
+				if _, err := b.handleFetch(ctx, "", req); err != nil {
 					t.Error(err)
 				}
 			}()
