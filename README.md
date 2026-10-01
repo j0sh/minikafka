@@ -58,7 +58,7 @@ func main() {
 	defer cancel()
 
 	broker, err := minikafka.Open(minikafka.Config{
-		Addr:             "127.0.0.1:0",
+		Addr:             "127.0.0.1:9092",
 		Store:            memory.Open(),
 		AutoCreateTopics: true,
 	})
@@ -77,11 +77,12 @@ func main() {
 }
 ```
 
+An empty `Config.Addr` defaults to `127.0.0.1:9092`.
+
 `Open` binds the TCP listener synchronously and returns any bind error. `Addr()`
-immediately returns the actual bound address, including the assigned port when
-using `:0`, and remains unchanged after shutdown. Always call `Close` after a
-successful `Open`, even if `Serve` is never called or returns an error. If `Open`
-fails, it leaves the supplied store untouched.
+immediately returns the bound address and remains unchanged after shutdown.
+Always call `Close` after a successful `Open`, even if `Serve` is never called or
+returns an error. If `Open` fails, it leaves the supplied store untouched.
 
 Call `Serve(ctx)` once per broker to initialize the store and accept connections.
 Connections can queue on the bound listener before initialization finishes, but

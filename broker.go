@@ -77,7 +77,7 @@ func Open(cfg Config) (*Broker, error) {
 		cfg.DefaultPartitions = 1
 	}
 	if cfg.Addr == "" {
-		cfg.Addr = "127.0.0.1:0"
+		cfg.Addr = "127.0.0.1:9092"
 	}
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
@@ -98,8 +98,7 @@ func Open(cfg Config) (*Broker, error) {
 	}, nil
 }
 
-// Addr returns the bound address, including the resolved port. It is available
-// immediately after Open and remains unchanged, including after Close.
+// Addr returns the address bound by Open.
 func (b *Broker) Addr() string {
 	return b.addr
 }

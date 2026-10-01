@@ -50,6 +50,9 @@ func TestOpenBindsBeforeServe(t *testing.T) {
 			if n, err := strconv.Atoi(port); err != nil || n <= 0 {
 				t.Fatalf("bound port = %q, err=%v", port, err)
 			}
+			if addr == "" && port != "9092" {
+				t.Fatalf("default bound port = %q, want 9092", port)
+			}
 			if store.initCalls.Load() != 0 || store.closeCalls.Load() != 0 {
 				t.Fatal("Open touched the store")
 			}
