@@ -77,7 +77,8 @@ func main() {
 }
 ```
 
-An empty `Config.Addr` defaults to `127.0.0.1:9092`.
+An empty `Config.Addr` defaults to `127.0.0.1:9092`. Set `Config.AdvertisedAddr`
+(e.g. `"kafka.example.com:443"`) when clients connect through a proxy or external address.
 
 `Open` binds the TCP listener synchronously and returns any bind error. `Addr()`
 immediately returns the bound address and remains unchanged after shutdown.

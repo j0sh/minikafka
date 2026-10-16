@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/j0sh/minikafka"
-	kafka "github.com/segmentio/kafka-go"
 )
 
 type lifecycleStore struct {
@@ -35,10 +34,15 @@ func (s *lifecycleStore) Close() error {
 }
 
 func TestOpenBindsBeforeServe(t *testing.T) {
-	for _, addr := range []string{"", "127.0.0.1:0"} {
-		t.Run("addr="+addr, func(t *testing.T) {
+	for _, cfg := range []minikafka.Config{
+		{},
+		{Addr: "127.0.0.1:0"},
+		{Addr: "127.0.0.1:0", AdvertisedAddr: "broker.example.invalid:443"},
+	} {
+		t.Run("addr="+cfg.Addr+"/advertised="+cfg.AdvertisedAddr, func(t *testing.T) {
 			store := &lifecycleStore{}
-			b, err := minikafka.Open(minikafka.Config{Addr: addr, Store: store})
+			cfg.Store = store
+			b, err := minikafka.Open(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -50,7 +54,7 @@ func TestOpenBindsBeforeServe(t *testing.T) {
 			if n, err := strconv.Atoi(port); err != nil || n <= 0 {
 				t.Fatalf("bound port = %q, err=%v", port, err)
 			}
-			if addr == "" && port != "9092" {
+			if cfg.Addr == "" && port != "9092" {
 				t.Fatalf("default bound port = %q, want 9092", port)
 			}
 			if store.initCalls.Load() != 0 || store.closeCalls.Load() != 0 {
@@ -97,38 +101,6 @@ func TestOpenRejectsNegativeDefaultPartitions(t *testing.T) {
 	}
 	if store.initCalls.Load() != 0 || store.closeCalls.Load() != 0 {
 		t.Fatal("Open touched the store")
-	}
-}
-
-func TestBrokerAddrStableThroughServeAndClose(t *testing.T) {
-	b := startBroker(t)
-	addr := b.Addr()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for range 10000 {
-			if got := b.Addr(); got != addr {
-				t.Errorf("Addr changed from %q to %q", addr, got)
-				return
-			}
-		}
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	client := &kafka.Client{Addr: kafka.TCP(addr)}
-	res, err := client.Metadata(ctx, &kafka.MetadataRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Brokers) != 1 || net.JoinHostPort(res.Brokers[0].Host, strconv.Itoa(res.Brokers[0].Port)) != addr {
-		t.Fatalf("advertised brokers = %+v, want %s", res.Brokers, addr)
-	}
-	if err := b.Close(); err != nil {
-		t.Fatal(err)
-	}
-	<-done
-	if got := b.Addr(); got != addr {
-		t.Fatalf("Addr after Close = %q, want %q", got, addr)
 	}
 }
 

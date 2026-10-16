@@ -4,6 +4,7 @@ import "time"
 
 type Config struct {
 	Addr              string
+	AdvertisedAddr    string
 	Store             Store
 	SASL              *SASLConfig
 	Authorization     *AuthorizationConfig

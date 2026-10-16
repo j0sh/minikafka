@@ -62,6 +62,23 @@ func Open(cfg Config) (*Broker, error) {
 	if cfg.DefaultPartitions < 0 {
 		return nil, ErrInvalidPartition
 	}
+	var host string
+	var port int32
+	if cfg.AdvertisedAddr != "" {
+		advertisedHost, portStr, err := net.SplitHostPort(cfg.AdvertisedAddr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid advertised address %q: %w", cfg.AdvertisedAddr, err)
+		}
+		if advertisedHost == "" {
+			return nil, fmt.Errorf("invalid advertised address %q: host is required", cfg.AdvertisedAddr)
+		}
+		advertisedPort, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil || advertisedPort == 0 {
+			return nil, fmt.Errorf("invalid advertised address %q: port must be an integer between 1 and 65535", cfg.AdvertisedAddr)
+		}
+		host, port = advertisedHost, int32(advertisedPort)
+	}
+
 	auth, err := newBrokerAuth(cfg.SASL)
 	if err != nil {
 		return nil, err
@@ -84,7 +101,9 @@ func Open(cfg Config) (*Broker, error) {
 		return nil, err
 	}
 	addr := ln.Addr().String()
-	host, port := splitAddr(addr)
+	if cfg.AdvertisedAddr == "" {
+		host, port = splitAddr(addr)
+	}
 	return &Broker{
 		cfg:           cfg,
 		auth:          auth,
